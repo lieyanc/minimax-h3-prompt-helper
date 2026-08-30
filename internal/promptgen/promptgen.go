@@ -14,17 +14,42 @@ import (
 	"h3helper/internal/validate"
 )
 
-// Build returns the message list for a fresh generation.
-func Build(t *task.Task) []llm.Message {
+// ReferenceImage is an original task image prepared as an inline data URL for
+// the multimodal writer. Label text is placed immediately before each image so
+// the model can reliably connect the bytes to <Picture 1>, <Picture 2>, etc.
+type ReferenceImage struct {
+	Label   string
+	DataURL string
+}
+
+// BuildMultimodal returns a fresh generation request with every original
+// reference image attached to the user's brief.
+func BuildMultimodal(t *task.Task, images []ReferenceImage) []llm.Message {
+	user := llm.Text("user", userPrompt(t))
+	for _, img := range images {
+		if strings.TrimSpace(img.DataURL) == "" {
+			continue
+		}
+		label := strings.TrimSpace(img.Label)
+		if label == "" {
+			label = "reference image"
+		}
+		user.Parts = append(user.Parts,
+			llm.Part{Text: fmt.Sprintf("Original reference image %s. Inspect these pixels directly; the vision fact sheet is only a summary.", label)},
+			llm.Part{ImageURL: img.DataURL},
+		)
+	}
 	return []llm.Message{
 		llm.Text("system", systemPrompt(t)),
-		llm.Text("user", userPrompt(t)),
+		user,
 	}
 }
 
-// BuildRepair returns the message list for a repair round, feeding the failed
-// output and the validator findings back to the model.
-func BuildRepair(t *task.Task, previous string, findings []validate.Finding) []llm.Message {
+// Repair appends a deterministic validation failure to an existing request.
+// Keeping the caller's base messages is important for multimodal generation
+// and revisions: the original images and the user's latest instruction remain
+// visible during every automatic repair round.
+func Repair(base []llm.Message, previous string, findings []validate.Finding) []llm.Message {
 	var b strings.Builder
 	b.WriteString("The prompt you produced failed the deterministic format check.\n\n")
 	b.WriteString("--- your previous output ---\n")
@@ -45,21 +70,81 @@ func BuildRepair(t *task.Task, previous string, findings []validate.Finding) []l
 	}
 	b.WriteString("\nRewrite the complete prompt with every problem fixed. Keep everything that was already correct. Output only the prompt.")
 
-	return []llm.Message{
-		llm.Text("system", systemPrompt(t)),
-		llm.Text("user", userPrompt(t)),
-		llm.Text("assistant", previous),
-		llm.Text("user", b.String()),
+	msgs := append([]llm.Message{}, base...)
+	msgs = append(msgs, llm.Text("assistant", previous), llm.Text("user", b.String()))
+	return msgs
+}
+
+// BuildRevision reconstructs the writer conversation from the original brief,
+// original images and completed revisions, then adds the user's new request.
+// This lets requests such as "撤回刚才的改动" work without dropping the skill
+// context or asking the user to repeat earlier decisions.
+func BuildRevision(t *task.Task, images []ReferenceImage, request string) []llm.Message {
+	msgs := BuildMultimodal(t, images)
+
+	// The replay opens with the prompt as it stood before the first revision.
+	// Only Revisions[0].PreviousPrompt records that moment: the attempt list
+	// also holds the repair drafts of every round, so any attempt picked from
+	// it would put the wrong version at the wrong point in the conversation. A
+	// task written before revisions existed may not carry it, and then the
+	// replay simply starts at the first revision request.
+	last := ""
+	if len(t.Revisions) > 0 {
+		last = strings.TrimSpace(t.Revisions[0].PreviousPrompt)
+	} else {
+		last = strings.TrimSpace(t.Prompt)
 	}
+	if last != "" {
+		msgs = append(msgs, llm.Text("assistant", last))
+	}
+
+	for _, revision := range t.Revisions {
+		if strings.TrimSpace(revision.Request) == "" || strings.TrimSpace(revision.Prompt) == "" {
+			continue
+		}
+		msgs = append(msgs,
+			llm.Text("user", revisionPrompt(revision.Request)),
+			llm.Text("assistant", revision.Prompt),
+		)
+		last = strings.TrimSpace(revision.Prompt)
+	}
+
+	// A prompt the user edited by hand is in no turn above, and neither is the
+	// current prompt of a task whose revision history could not be replayed.
+	switch current := strings.TrimSpace(t.Prompt); {
+	case current == "" || current == last:
+	case last == "":
+		msgs = append(msgs, llm.Text("assistant", current))
+	default:
+		msgs = append(msgs,
+			llm.Text("user", "I manually edited the prompt after the previous turn. Treat the next assistant message as the current complete prompt."),
+			llm.Text("assistant", current),
+		)
+	}
+
+	msgs = append(msgs, llm.Text("user", revisionPrompt(request)))
+	return msgs
+}
+
+func revisionPrompt(request string) string {
+	return `Revise the current complete H3 prompt according to the user's request below.
+
+Keep every original workflow constraint, reference-label rule, verbatim line, and skill requirement that the request does not explicitly change. Re-inspect the attached original reference images when the requested change concerns visible content. Return the entire revised prompt, not a patch or an explanation. Output only the prompt.
+
+User request:
+` + strings.TrimSpace(request)
 }
 
 func systemPrompt(t *task.Task) string {
 	var b strings.Builder
 	b.WriteString("You are a MiniMax H3 prompt engineer. You rewrite a structured brief into a final H3 generation prompt.\n\n")
-	b.WriteString("Follow this guide exactly. Field names, section order, labels and timing notation are not negotiable.\n\n")
-	b.WriteString("===== BEGIN GUIDE =====\n")
-	b.WriteString(skill.GuideFor(t.Constraints.Mode))
-	b.WriteString("\n===== END GUIDE =====\n\n")
+	b.WriteString("The original skill and every reference document it requires are included below. Follow them exactly. Field names, section order, labels and timing notation are not negotiable.\n\n")
+	b.WriteString("===== BEGIN ORIGINAL SKILL.md =====\n")
+	b.WriteString(skill.SkillMD())
+	b.WriteString("\n===== END ORIGINAL SKILL.md =====\n\n")
+	b.WriteString(fmt.Sprintf("===== BEGIN REQUIRED REFERENCE GUIDES (%s) =====\n", t.Constraints.Mode))
+	b.WriteString(skill.FullGuideFor(t.Constraints.Mode))
+	b.WriteString("\n===== END REQUIRED REFERENCE GUIDES =====\n\n")
 
 	b.WriteString("Output rules:\n")
 	b.WriteString("- Output ONLY the final prompt. No markdown fences, no headings, no explanation, no translation.\n")

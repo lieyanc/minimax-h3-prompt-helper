@@ -82,15 +82,15 @@ func TestLoadFillsInMissingKeysAndRewritesTheFile(t *testing.T) {
 	if cfg.Listen != "0.0.0.0:8199" || cfg.Models[0].MaxTokens != defaultMaxTokens || !cfg.StrictEnglish {
 		t.Errorf("defaults were not merged in: %+v", cfg)
 	}
-	// Both roles have to land on the only model there is.
-	if cfg.Vision.ModelID != "m" || cfg.Writer.ModelID != "m" {
-		t.Errorf("roles = %+v / %+v, want both pointing at the single model", cfg.Vision, cfg.Writer)
+	// All roles have to land on the only model there is.
+	if cfg.Vision.ModelID != "m" || cfg.Question.ModelID != "m" || cfg.Writer.ModelID != "m" {
+		t.Errorf("roles = %+v / %+v / %+v, want all pointing at the single model", cfg.Vision, cfg.Question, cfg.Writer)
 	}
 
 	filled := m.Filled()
 	// A partially present object reports its missing leaves; an object that is
 	// absent entirely is reported once, by its own name.
-	for _, want := range []string{"listen", "vision", "writer", "models[0].maxTokens"} {
+	for _, want := range []string{"listen", "vision", "question", "writer", "models[0].maxTokens"} {
 		if !slices.Contains(filled, want) {
 			t.Errorf("Filled() = %v, want it to mention %q", filled, want)
 		}
@@ -250,8 +250,8 @@ func TestLoadRepairsUnusableValuesButKeepsMeaningfulZeros(t *testing.T) {
 		t.Errorf("non-positive maxTokens should fall back: %+v", cfg.Models)
 	}
 	// An unknown role target falls back; a valid one is left alone.
-	if cfg.Vision.ModelID != "v" || cfg.Writer.ModelID != "w" {
-		t.Errorf("roles = %q / %q, want the unknown one repaired and the valid one kept", cfg.Vision.ModelID, cfg.Writer.ModelID)
+	if cfg.Vision.ModelID != "v" || cfg.Question.ModelID != "w" || cfg.Writer.ModelID != "w" {
+		t.Errorf("roles = %q / %q / %q, want the question role to follow the valid writer", cfg.Vision.ModelID, cfg.Question.ModelID, cfg.Writer.ModelID)
 	}
 	// These zeros mean something and must survive.
 	if cfg.MaxRepairRounds != 0 {

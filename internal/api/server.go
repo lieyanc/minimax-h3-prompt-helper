@@ -64,6 +64,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/uploads/{file}", s.guard(s.handleUploadedImage))
 	mux.HandleFunc("POST /api/tasks/{id}/analyze", s.guard(s.handleAnalyze))
 	mux.HandleFunc("POST /api/tasks/{id}/generate", s.guard(s.handleGenerate))
+	mux.HandleFunc("POST /api/tasks/{id}/revise", s.guard(s.handleRevise))
 	mux.HandleFunc("POST /api/tasks/{id}/validate", s.guard(s.handleValidate))
 
 	if s.static != nil {
@@ -178,8 +179,13 @@ type configPatch struct {
 		ImageMaxEdge *int    `json:"imageMaxEdge"`
 	} `json:"vision"`
 
-	Writer *struct {
+	Question *struct {
 		ModelID *string `json:"modelId"`
+	} `json:"question"`
+
+	Writer *struct {
+		ModelID      *string `json:"modelId"`
+		ImageMaxEdge *int    `json:"imageMaxEdge"`
 	} `json:"writer"`
 }
 
@@ -213,8 +219,12 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 			setString(&c.Vision.ModelID, v.ModelID)
 			setInt(&c.Vision.ImageMaxEdge, v.ImageMaxEdge)
 		}
+		if v := patch.Question; v != nil {
+			setString(&c.Question.ModelID, v.ModelID)
+		}
 		if v := patch.Writer; v != nil {
 			setString(&c.Writer.ModelID, v.ModelID)
+			setInt(&c.Writer.ImageMaxEdge, v.ImageMaxEdge)
 		}
 	})
 	if err != nil {
@@ -257,6 +267,8 @@ func (s *Server) handleTestConfig(w http.ResponseWriter, r *http.Request) {
 	switch id := strings.TrimSpace(r.URL.Query().Get("modelId")); {
 	case id != "":
 		ep, err = s.cfg.Resolve(id)
+	case r.URL.Query().Get("target") == "question":
+		ep, err = s.cfg.QuestionEndpoint()
 	case r.URL.Query().Get("target") == "writer":
 		ep, err = s.cfg.WriterEndpoint()
 	default:
@@ -448,7 +460,7 @@ func (s *Server) handlePatchTask(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			// Clearing a slot to re-ask it is not a question round.
-			if len(answered) > 0 {
+			if len(answered) > 0 || submitted {
 				t.Rounds = append(t.Rounds, task.Round{
 					Index:     len(t.Rounds) + 1,
 					Questions: t.Pending,
@@ -719,6 +731,11 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	images, err := s.writerImages(t)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	sse, err := newSSE(w)
 	if err != nil {
@@ -727,55 +744,20 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	}
 	defer sse.close()
 
-	cfg := s.cfg.Snapshot()
 	spec := s.specFor(t)
-
-	msgs := promptgen.Build(t)
-	var prompt string
-	var findings []validate.Finding
-	var attempts []task.Attempt
-
-	for round := 0; ; round++ {
-		if round > 0 {
-			sse.send("repair", map[string]any{"round": round, "findings": findings})
-			msgs = promptgen.BuildRepair(t, prompt, findings)
-		}
-		sse.send("progress", map[string]any{"state": "writing", "round": round})
-
-		out, err := client.Stream(r.Context(), msgs, llm.Options{}, func(delta llm.Delta) {
-			if delta.Reasoning != "" {
-				sse.send("reasoning", map[string]any{"text": delta.Reasoning, "round": round})
-			}
-			if delta.Content != "" {
-				sse.send("delta", map[string]any{"text": delta.Content, "round": round})
-			}
-		})
-		if err != nil {
-			sse.send("error", map[string]any{"error": err.Error()})
-			s.markError(id, err.Error())
-			return
-		}
-
-		prompt = cleanOutput(out)
-		findings = nonNil(validate.Check(prompt, spec))
-		attempts = append(attempts, task.Attempt{
-			Index:    round + 1,
-			Prompt:   prompt,
-			Findings: findings,
-			Repaired: round > 0,
-			At:       time.Now(),
-		})
-		sse.send("validated", map[string]any{"round": round, "findings": findings, "prompt": prompt})
-
-		if !validate.HasErrors(findings) || round >= cfg.MaxRepairRounds {
-			break
-		}
+	msgs := promptgen.BuildMultimodal(t, images)
+	prompt, findings, attempts, err := s.streamWriter(r.Context(), client, sse, msgs, spec, 0)
+	if err != nil {
+		sse.send("error", map[string]any{"error": err.Error()})
+		s.markError(id, err.Error())
+		return
 	}
 
 	final, err := s.store.Update(id, func(t *task.Task) error {
 		t.Prompt = prompt
 		t.Findings = findings
 		t.Attempts = attempts
+		t.Revisions = nil
 		t.GeneratedAt = time.Now()
 		t.Status = task.StatusDone
 		t.Error = ""
@@ -786,6 +768,164 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sse.send("done", s.taskView(final))
+}
+
+type reviseRequest struct {
+	Message string `json:"message"`
+}
+
+// handleRevise lets the user continue with the multimodal writer after the
+// first result. Each turn gets the original skill, workflow/answer context,
+// original images, current prompt and prior revision history, then goes through
+// the same deterministic validation and repair loop as fresh generation.
+func (s *Server) handleRevise(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	var req reviseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体不是合法 JSON: "+err.Error())
+		return
+	}
+	message := strings.TrimSpace(req.Message)
+	if message == "" {
+		writeError(w, http.StatusBadRequest, "请先写明要怎么修改")
+		return
+	}
+	if len(message) > 12000 {
+		writeError(w, http.StatusBadRequest, "修改要求太长，请缩短到 12000 字节以内")
+		return
+	}
+
+	id := r.PathValue("id")
+	t, err := s.store.Get(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if strings.TrimSpace(t.Prompt) == "" {
+		writeError(w, http.StatusBadRequest, "还没有可修改的提示词，请先生成一次")
+		return
+	}
+	if pending := visionBlockers(t); len(pending) > 0 {
+		writeError(w, http.StatusBadRequest, visionGateMessage(pending))
+		return
+	}
+
+	client, err := s.writerClient()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	images, err := s.writerImages(t)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	sse, err := newSSE(w)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer sse.close()
+
+	msgs := promptgen.BuildRevision(t, images, message)
+	previousPrompt := t.Prompt
+	prompt, findings, attempts, err := s.streamWriter(
+		r.Context(), client, sse, msgs, s.specFor(t), len(t.Attempts),
+	)
+	if err != nil {
+		sse.send("error", map[string]any{"error": err.Error()})
+		s.markError(id, err.Error())
+		return
+	}
+
+	final, err := s.store.Update(id, func(t *task.Task) error {
+		t.Prompt = prompt
+		t.Findings = findings
+		t.Attempts = append(t.Attempts, attempts...)
+		t.Revisions = append(t.Revisions, task.Revision{
+			Index: len(t.Revisions) + 1, Request: message,
+			PreviousPrompt: previousPrompt, Prompt: prompt,
+			Findings: findings, At: time.Now(),
+		})
+		t.GeneratedAt = time.Now()
+		t.Status = task.StatusDone
+		t.Error = ""
+		return nil
+	})
+	if err != nil {
+		sse.send("error", map[string]any{"error": err.Error()})
+		return
+	}
+	sse.send("done", s.taskView(final))
+}
+
+// streamWriter runs one complete write or revision plus bounded automatic
+// repairs. base always remains intact, which preserves original image parts on
+// every round.
+func (s *Server) streamWriter(
+	ctx context.Context,
+	client *llm.Client,
+	sse *sseWriter,
+	base []llm.Message,
+	spec validate.Spec,
+	attemptOffset int,
+) (string, []validate.Finding, []task.Attempt, error) {
+	cfg := s.cfg.Snapshot()
+	msgs := base
+	var prompt string
+	var findings []validate.Finding
+	var attempts []task.Attempt
+
+	for round := 0; ; round++ {
+		if round > 0 {
+			sse.send("repair", map[string]any{"round": round, "findings": findings})
+			msgs = promptgen.Repair(base, prompt, findings)
+		}
+		sse.send("progress", map[string]any{"state": "writing", "round": round})
+
+		out, err := client.Stream(ctx, msgs, llm.Options{}, func(delta llm.Delta) {
+			if delta.Reasoning != "" {
+				sse.send("reasoning", map[string]any{"text": delta.Reasoning, "round": round})
+			}
+			if delta.Content != "" {
+				sse.send("delta", map[string]any{"text": delta.Content, "round": round})
+			}
+		})
+		if err != nil {
+			return "", nil, nil, err
+		}
+
+		prompt = cleanOutput(out)
+		findings = nonNil(validate.Check(prompt, spec))
+		attempts = append(attempts, task.Attempt{
+			Index: attemptOffset + round + 1, Prompt: prompt, Findings: findings,
+			Repaired: round > 0, At: time.Now(),
+		})
+		sse.send("validated", map[string]any{"round": round, "findings": findings, "prompt": prompt})
+
+		if !validate.HasErrors(findings) || round >= cfg.MaxRepairRounds {
+			return prompt, findings, attempts, nil
+		}
+	}
+}
+
+// writerImages prepares every original reference image for the multimodal
+// writer. In particular, a two-image task sends both labeled image parts.
+func (s *Server) writerImages(t *task.Task) ([]promptgen.ReferenceImage, error) {
+	maxEdge := s.cfg.Snapshot().Writer.ImageMaxEdge
+	images := make([]promptgen.ReferenceImage, 0, len(t.Images))
+	for _, img := range t.Images {
+		path, err := s.imagePath(t, img)
+		if err != nil {
+			return nil, fmt.Errorf("准备 %s 给写作模型失败: %w", img.Label, err)
+		}
+		dataURL, err := llm.DataURL(path, maxEdge)
+		if err != nil {
+			return nil, fmt.Errorf("读取 %s 给写作模型失败: %w", img.Label, err)
+		}
+		images = append(images, promptgen.ReferenceImage{Label: img.Label, DataURL: dataURL})
+	}
+	return images, nil
 }
 
 func (s *Server) markError(id, msg string) {
@@ -825,6 +965,14 @@ func (s *Server) writerClient() (*llm.Client, error) {
 	ep, err := s.cfg.WriterEndpoint()
 	if err != nil {
 		return nil, fmt.Errorf("写作模型没配好: %w", err)
+	}
+	return clientFor(ep), nil
+}
+
+func (s *Server) questionClient() (*llm.Client, error) {
+	ep, err := s.cfg.QuestionEndpoint()
+	if err != nil {
+		return nil, fmt.Errorf("提问模型没配好: %w", err)
 	}
 	return clientFor(ep), nil
 }
@@ -986,6 +1134,7 @@ func normalize(t *task.Task) {
 	t.Images = nonNil(t.Images)
 	t.Rounds = nonNil(t.Rounds)
 	t.Attempts = nonNil(t.Attempts)
+	t.Revisions = nonNil(t.Revisions)
 	t.Findings = nonNil(t.Findings)
 	t.Pending = nonNil(t.Pending)
 	t.Asked = nonNil(t.Asked)

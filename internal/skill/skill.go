@@ -20,16 +20,13 @@ var refGuide string
 // SkillMD is the skill front matter and workflow overview.
 func SkillMD() string { return skillMD }
 
-// BaseGuide is the T2VA / I2VA / FL2VA / L2VA writing guide.
-func BaseGuide() string { return baseGuide }
-
-// RefGuide is the full-reference (Ref2VA) rewrite format guide.
-func RefGuide() string { return refGuide }
-
-// GuideFor returns the reference guide that applies to an input mode.
-func GuideFor(mode string) string {
+// FullGuideFor returns every reference document the original SKILL.md tells an
+// agent to read. Ref2VA's guide explicitly delegates the shared shot, camera,
+// dialogue and audio rules to base-en.txt, so full-reference calls need both
+// documents in context rather than only ref-en.txt.
+func FullGuideFor(mode string) string {
 	if mode == "Ref2VA" {
-		return refGuide
+		return baseGuide + "\n\n" + refGuide
 	}
 	return baseGuide
 }

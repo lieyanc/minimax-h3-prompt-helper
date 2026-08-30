@@ -2,9 +2,14 @@ package questions
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"h3helper/internal/llm"
 	"h3helper/internal/skill"
 	"h3helper/internal/slots"
 	"h3helper/internal/task"
@@ -53,6 +58,35 @@ func TestNextNeedsAClientOnceTheBriefIsIn(t *testing.T) {
 	tk.Asked = []task.Question{{Slot: slots.Brief, Role: task.RoleBrief}}
 	if _, err := Next(context.Background(), nil, tk); err == nil {
 		t.Fatal("planning without an endpoint should fail so the caller can fall back")
+	}
+}
+
+func TestNextUsesTheSelectedModelsConfiguredTokenBudget(t *testing.T) {
+	const configured = 4321
+	gotTokens := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			MaxTokens int `json:"max_tokens"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		gotTokens = body.MaxTokens
+		reply := `{"done":true,"note":"够了","page":{"questions":[]}}`
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\ndata: [DONE]\n\n", reply)
+	}))
+	defer upstream.Close()
+
+	tk := refTask()
+	tk.Answers[slots.Brief] = "她走上站台"
+	tk.Asked = []task.Question{{Slot: slots.Brief, Role: task.RoleBrief}}
+	client := llm.New(upstream.URL, "", "fast-question", configured, 0.2, "")
+	if _, err := Next(context.Background(), client, tk); err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if gotTokens != configured {
+		t.Fatalf("question max_tokens = %d, want configured value %d", gotTokens, configured)
 	}
 }
 
@@ -186,14 +220,14 @@ func TestParsePageKeepsOneQuestionPerRole(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parsePage: %v", err)
 	}
-	if len(page.Questions) != 3 {
-		t.Fatalf("got %d questions, want the split camera question collapsed: %v", len(page.Questions), page.Questions)
+	if len(page.Questions) != MaxQuestions {
+		t.Fatalf("got %d questions, want the concise page cap %d: %v", len(page.Questions), MaxQuestions, page.Questions)
 	}
 	if page.Questions[0].Slot != "amplitude" {
 		t.Errorf("kept %q, want the first of the two camera questions", page.Questions[0].Slot)
 	}
-	if page.Questions[1].Label != "<Picture 1>" || page.Questions[2].Label != "<Picture 2>" {
-		t.Error("one question per reference label must survive the role check")
+	if page.Questions[1].Label != "<Picture 1>" {
+		t.Error("the first reference-specific question should survive the role check")
 	}
 }
 
@@ -218,5 +252,20 @@ func TestFallbackAsksTheFixedTable(t *testing.T) {
 	}
 	if !strings.Contains(page.Intro, "接口超时") {
 		t.Errorf("intro = %q, want it to say why", page.Intro)
+	}
+}
+
+func TestInterviewStopsAfterFourConcisePages(t *testing.T) {
+	tk := refTask()
+	tk.Answers[slots.Brief] = "她走上站台"
+	tk.Asked = []task.Question{{Slot: slots.Brief, Role: task.RoleBrief}}
+	tk.Rounds = make([]task.Round, maxPages)
+
+	page, err := Next(context.Background(), nil, tk)
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if !page.Done || len(page.Questions) != 0 {
+		t.Fatalf("page = %+v, want the interview to stop without another model call", page)
 	}
 }

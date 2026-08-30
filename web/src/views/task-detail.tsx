@@ -9,6 +9,7 @@ import {
   PlayIcon,
   RefreshCwIcon,
   ScanEyeIcon,
+  SendIcon,
   SkipForwardIcon,
   SparklesIcon,
 } from "lucide-react"
@@ -33,6 +34,12 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { Progress } from "@/components/ui/progress"
+import {
+  Field,
+  FieldDescription,
+  FieldGroup,
+  FieldLabel,
+} from "@/components/ui/field"
 import { Separator } from "@/components/ui/separator"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
@@ -68,6 +75,7 @@ export function TaskDetailView({ id }: { id: string }) {
   const [repairRound, setRepairRound] = useState(0)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState("")
+  const [revisionText, setRevisionText] = useState("")
   const reasoningRef = useRef<HTMLPreElement>(null)
   const streamRef = useRef<HTMLPreElement>(null)
 
@@ -191,14 +199,19 @@ export function TaskDetailView({ id }: { id: string }) {
     }
   }
 
-  const generate = async () => {
+  const runWriter = async (
+    path: string,
+    body: unknown,
+    successMessage: string
+  ) => {
+    let succeeded = false
     setGenerating(true)
     setReasoningText("")
     setStreamText("")
     setLiveFindings(null)
     setRepairRound(0)
     try {
-      await streamPost(`/api/tasks/${id}/generate`, {}, (evt) => {
+      await streamPost(path, body, (evt) => {
         switch (evt.event) {
           case "reasoning":
             setReasoningText(
@@ -220,11 +233,12 @@ export function TaskDetailView({ id }: { id: string }) {
             setLiveFindings((evt.data as { findings: Finding[] }).findings)
             break
           case "done":
+            succeeded = true
             setTask(evt.data as Task)
             setReasoningText("")
             setStreamText("")
             setLiveFindings(null)
-            toast.success("提示词已生成")
+            toast.success(successMessage)
             break
           case "error":
             toast.error((evt.data as { error: string }).error)
@@ -235,6 +249,24 @@ export function TaskDetailView({ id }: { id: string }) {
       toast.error((e as Error).message)
     } finally {
       setGenerating(false)
+    }
+    return succeeded
+  }
+
+  const generate = () =>
+    runWriter(`/api/tasks/${id}/generate`, {}, "提示词已生成")
+
+  const revise = async () => {
+    const message = revisionText.trim()
+    if (!message) return
+    if (
+      await runWriter(
+        `/api/tasks/${id}/revise`,
+        { message },
+        "writer 已完成修改"
+      )
+    ) {
+      setRevisionText("")
     }
   }
 
@@ -696,7 +728,12 @@ export function TaskDetailView({ id }: { id: string }) {
                         </Button>
                         {task.attempts?.length > 1 ? (
                           <Badge variant="outline">
-                            共 {task.attempts.length} 次尝试
+                            共 {task.attempts.length} 次 writer 输出
+                          </Badge>
+                        ) : null}
+                        {task.revisions?.length > 0 ? (
+                          <Badge variant="secondary">
+                            已修改 {task.revisions.length} 轮
                           </Badge>
                         ) : null}
                       </div>
@@ -726,6 +763,58 @@ export function TaskDetailView({ id }: { id: string }) {
                       )}
 
                       <Findings findings={task.findings ?? []} />
+
+                      <Separator />
+
+                      <form
+                        onSubmit={(event) => {
+                          event.preventDefault()
+                          if (!generating) void revise()
+                        }}
+                      >
+                        <FieldGroup>
+                          <Field>
+                            <FieldLabel htmlFor="writer-revision">
+                              继续让 writer 修改
+                            </FieldLabel>
+                            <Textarea
+                              id="writer-revision"
+                              value={revisionText}
+                              rows={3}
+                              disabled={generating}
+                              placeholder="例：保留人物动作，把镜头改成从全景缓慢推进到手部特写；不要改台词"
+                              onChange={(event) =>
+                                setRevisionText(event.target.value)
+                              }
+                            />
+                            <FieldDescription>
+                              每次修改都会重新注入原始
+                              skill、工作流约束、全部答案和原始参考图，再执行完整校验。
+                            </FieldDescription>
+                          </Field>
+                          <Field orientation="horizontal">
+                            <Button
+                              type="submit"
+                              size="sm"
+                              disabled={
+                                generating || revisionText.trim().length === 0
+                              }
+                            >
+                              {generating ? (
+                                <Spinner data-icon="inline-start" />
+                              ) : (
+                                <SendIcon data-icon="inline-start" />
+                              )}
+                              发送修改要求
+                            </Button>
+                            {task.revisions?.length > 0 ? (
+                              <FieldDescription>
+                                writer 记得前 {task.revisions.length} 轮修改
+                              </FieldDescription>
+                            ) : null}
+                          </Field>
+                        </FieldGroup>
+                      </form>
                     </>
                   ) : null}
 

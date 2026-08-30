@@ -231,6 +231,19 @@ type Attempt struct {
 	At       time.Time          `json:"at"`
 }
 
+// Revision is one user request made after generation and the complete prompt
+// the writer returned for it. Keeping the request with the result lets later
+// turns understand references such as "撤回刚才的改动" without losing the
+// original brief or multimodal context.
+type Revision struct {
+	Index          int                `json:"index"`
+	Request        string             `json:"request"`
+	PreviousPrompt string             `json:"previousPrompt,omitempty"`
+	Prompt         string             `json:"prompt"`
+	Findings       []validate.Finding `json:"findings"`
+	At             time.Time          `json:"at"`
+}
+
 // Task is one prompt-writing session, persisted as a single JSON file.
 type Task struct {
 	ID        string    `json:"id"`
@@ -270,6 +283,7 @@ type Task struct {
 	Prompt      string             `json:"prompt"`
 	Findings    []validate.Finding `json:"findings"`
 	Attempts    []Attempt          `json:"attempts"`
+	Revisions   []Revision         `json:"revisions"`
 	GeneratedAt time.Time          `json:"generatedAt"`
 
 	Error string `json:"error,omitempty"`

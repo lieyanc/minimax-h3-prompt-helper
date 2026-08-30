@@ -176,9 +176,13 @@ export function SettingsView() {
         renamed && cfg.vision.modelId === prev.id
           ? { ...cfg.vision, modelId: next.id }
           : cfg.vision,
+      question:
+        renamed && cfg.question.modelId === prev.id
+          ? { modelId: next.id }
+          : cfg.question,
       writer:
         renamed && cfg.writer.modelId === prev.id
-          ? { modelId: next.id }
+          ? { ...cfg.writer, modelId: next.id }
           : cfg.writer,
     })
   }
@@ -219,8 +223,14 @@ export function SettingsView() {
         cfg.vision.modelId === gone.id
           ? { ...cfg.vision, modelId: rest[0].id }
           : cfg.vision,
+      question:
+        cfg.question.modelId === gone.id
+          ? { modelId: rest[0].id }
+          : cfg.question,
       writer:
-        cfg.writer.modelId === gone.id ? { modelId: rest[0].id } : cfg.writer,
+        cfg.writer.modelId === gone.id
+          ? { ...cfg.writer, modelId: rest[0].id }
+          : cfg.writer,
     })
   }
 
@@ -249,7 +259,11 @@ export function SettingsView() {
           modelId: cfg.vision.modelId,
           imageMaxEdge: cfg.vision.imageMaxEdge,
         },
-        writer: { modelId: cfg.writer.modelId },
+        question: { modelId: cfg.question.modelId },
+        writer: {
+          modelId: cfg.writer.modelId,
+          imageMaxEdge: cfg.writer.imageMaxEdge,
+        },
       })
       setCfg(next)
       if (!opts?.silent) toast.success("配置已保存")
@@ -609,7 +623,8 @@ export function SettingsView() {
         <CardHeader>
           <CardTitle>分工</CardTitle>
           <CardDescription>
-            看图的和写提示词的可以是同一个模型，但采样参数本来就不一样，所以分成两条。
+            视觉模型提取事实，快速 question model 只追问关键缺口，多模态 writer
+            负责最终生成和后续修改。
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -659,14 +674,14 @@ export function SettingsView() {
               </Field>
             </Field>
             <Field>
-              <FieldLabel htmlFor="role-writer">写作模型</FieldLabel>
+              <FieldLabel htmlFor="role-question">Question model</FieldLabel>
               <Select
-                value={cfg.writer.modelId}
+                value={cfg.question.modelId}
                 onValueChange={(value) =>
-                  patch("writer", { modelId: value ?? "" })
+                  patch("question", { modelId: value ?? "" })
                 }
               >
-                <SelectTrigger id="role-writer" className="w-full">
+                <SelectTrigger id="role-question" className="w-full">
                   <SelectValue placeholder="选一个模型" />
                 </SelectTrigger>
                 <SelectContent>
@@ -680,8 +695,56 @@ export function SettingsView() {
                 </SelectContent>
               </Select>
               <FieldDescription>
-                负责把槽位和约束写成最终提示词，也负责校验失败后的返修。
+                建议选择速度快的小模型。每轮最多 2 个问题、最多 3
+                轮追问；输出长度使用所选模型的“最大输出
+                token”，可在上方模型卡修改。
               </FieldDescription>
+            </Field>
+            <Field orientation="responsive">
+              <Field>
+                <FieldLabel htmlFor="role-writer">多模态 writer</FieldLabel>
+                <Select
+                  value={cfg.writer.modelId}
+                  onValueChange={(value) =>
+                    patch("writer", {
+                      ...cfg.writer,
+                      modelId: value ?? "",
+                    })
+                  }
+                >
+                  <SelectTrigger id="role-writer" className="w-full">
+                    <SelectValue placeholder="选一个模型" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      {models.map((m) => (
+                        <SelectItem key={m.id} value={m.id}>
+                          {labelOf(m)}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+                <FieldDescription>
+                  必须能读图。生成、返修和用户继续修改时都会收到原始
+                  skill、答案以及全部参考图。
+                </FieldDescription>
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="w-edge">writer 图片最长边</FieldLabel>
+                <Input
+                  id="w-edge"
+                  type="number"
+                  value={cfg.writer.imageMaxEdge}
+                  onChange={(e) =>
+                    patch("writer", {
+                      ...cfg.writer,
+                      imageMaxEdge: Number(e.target.value),
+                    })
+                  }
+                />
+                <FieldDescription>0 表示把原图直接发给 writer</FieldDescription>
+              </Field>
             </Field>
           </FieldGroup>
         </CardContent>

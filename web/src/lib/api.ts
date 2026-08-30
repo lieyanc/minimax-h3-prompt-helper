@@ -273,6 +273,15 @@ export type Attempt = {
   at: string
 }
 
+export type Revision = {
+  index: number
+  request: string
+  previousPrompt?: string
+  prompt: string
+  findings: Finding[]
+  at: string
+}
+
 export type Step = "constraints" | "images" | "questions" | "generate"
 
 export type Task = {
@@ -298,6 +307,7 @@ export type Task = {
   prompt: string
   findings: Finding[]
   attempts: Attempt[]
+  revisions: Revision[]
   generatedAt: string
   error?: string
 
@@ -361,8 +371,12 @@ export type Config = {
     modelId: string
     imageMaxEdge: number
   }
+  question: {
+    modelId: string
+  }
   writer: {
     modelId: string
+    imageMaxEdge: number
   }
   strictEnglish: boolean
   maxRepairRounds: number
@@ -411,7 +425,10 @@ export const api = {
     }),
 
   /** Tests one model, by id or by the role it is assigned to. */
-  testConfig: (target: { modelId?: string; role?: "vision" | "writer" }) => {
+  testConfig: (target: {
+    modelId?: string
+    role?: "vision" | "question" | "writer"
+  }) => {
     const q = new URLSearchParams()
     if (target.modelId) q.set("modelId", target.modelId)
     if (target.role) q.set("target", target.role)

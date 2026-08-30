@@ -17,8 +17,9 @@ what you want and can see your reference images. This tool fills those two gaps:
 - **The vision model looks** — each reference image is read into a fixed JSON
   fact sheet (subjects, environment, lighting, composition, shot size, verbatim
   on-screen text) that pre-fills the answers.
-- **The question agent asks** — the guide, the workflow constraints and those
-  fact sheets go to a model, which writes the next page of questions itself.
+- **The fast question model asks** — the guide, the workflow constraints and
+  those fact sheets go to a separately selected fast model, which asks only
+  the highest-impact uncertainty it cannot safely infer.
   Two pictures may be a character and a location, two characters, or a location
   and a character; the questions follow what is actually in them instead of a
   fixed list.
@@ -36,18 +37,21 @@ One page at a time, with everything already fixed kept in the rail on the left:
    the duration adjustable on the model's frame grid.
 2. **参考图** — the pictures the workflow loads, plus any you attach here by
    hand, and the vision pass over them.
-3. **追问** — the interview, one agent-written page at a time. Each page is
-   planned after the previous one is handed in, so an answer can change what
-   gets asked next.
+3. **追问** — at most two questions per page and at most three adaptive
+   follow-up pages after the opening intent. Each page is planned after the
+   previous one is handed in, so an answer can change what gets asked next.
 4. **生成与校验** — write the prompt, validate it, repair it, and list whatever
-   still has to be done in ComfyUI. Reasoning and prompt text are streamed to
-   separate live panels when the provider exposes both.
+   still has to be done in ComfyUI. The multimodal writer receives the original
+   reference images as well as the vision fact sheets. After generation, the
+   user can keep asking the writer for changes; each revision is streamed,
+   validated and repaired through the same path.
 
 ## How the questions are decided
 
-`POST /api/tasks/{id}/plan` sends the embedded skill, the guide for the mode,
+`POST /api/tasks/{id}/plan` sends the embedded original skill, every reference
+document it requires for the mode,
 the workflow constraints, the vision facts and every answer so far to the
-**writing model**, and asks for one page of at most three questions. The model
+**question model**, and asks for one page of at most two questions. The model
 picks the wording, the options and the order; the server pins down the parts the
 rest of the pipeline depends on:
 
@@ -58,7 +62,7 @@ rest of the pipeline depends on:
   `retention`, `audio_retention`, `task_type`, `shots`) has its options replaced
   with the guide's canonical list, so an invented camera move cannot reach the
   prompt.
-- **Sanity.** Answered slots are never asked twice, a page is capped at three
+- **Sanity.** Answered slots are never asked twice, a page is capped at two
   questions, a choice with no options degrades to free text, and a suggestion
   that is not one of the options is dropped.
 - **Fallback.** If the endpoint is unreachable or the reply is unusable, the
@@ -66,8 +70,10 @@ rest of the pipeline depends on:
   opening intent question is always the fixed one — the agent has nothing to
   reason about before it.
 
-The interview ends when the agent reports it has everything, when you skip the
-rest, or after twelve pages.
+The interview ends when the agent reports it has enough, when you skip the
+rest, or after four pages total. Style, shot count, camera, sound and endings
+are inferred by the writer unless an ambiguity would materially change the
+result; the guide is not turned into a checklist.
 
 ## Reference images that are not in the workflow
 
@@ -173,14 +179,14 @@ run, while task data is kept under its `data/` directory by default:
 Pass `-data /path/to/data` to use another directory explicitly.
 
 Each task file keeps the full history: constraints, vision facts, every question
-the agent wrote and the answers given, every generation attempt and its
-findings.
+the agent wrote and the answers given, every generation attempt, writer
+revision request and validation finding.
 
 ## Configuration
 
 Endpoints come in two layers. A **provider** is one OpenAI-compatible address
 plus the key it needs; a **model** is what goes into the `model` field, which
-provider serves it, and its own sampling. The two roles then point at a model by
+provider serves it, and its own sampling. The three roles then point at a model by
 id:
 
 ```json
@@ -193,22 +199,33 @@ id:
     { "id": "vision", "providerId": "openai", "model": "gpt-4o",
       "displayName": "看图的模型", "maxTokens": 4096, "temperature": 0.2,
       "reasoningEffort": "" },
+    { "id": "question", "providerId": "openai", "model": "gpt-4o-mini",
+      "displayName": "快速提问模型", "maxTokens": 1200, "temperature": 0.2,
+      "reasoningEffort": "" },
     { "id": "writer", "providerId": "openai", "model": "gpt-4o",
       "displayName": "写提示词的模型", "maxTokens": 8192, "temperature": 0.7,
       "reasoningEffort": "" }
   ],
   "vision": { "modelId": "vision", "imageMaxEdge": 1280 },
-  "writer": { "modelId": "writer" }
+  "question": { "modelId": "question" },
+  "writer": { "modelId": "writer", "imageMaxEdge": 1280 }
 }
 ```
 
-Two entries on one model is the default, because the roles want opposite
-settings: the vision pass fills a fact sheet and should not improvise, the
-writing pass produces long text and needs the token budget for its repair
-rounds. Split them across providers when the model that can see is not the model
-that writes best — a local VLM for the images, a stronger remote one for the
-prompt. The question agent runs on the writing model, since it reads the same
-guide.
+Three entries are the default because the roles want different capabilities and
+budgets: the vision pass fills a fact sheet, the question pass should return a
+small JSON page quickly, and the multimodal writer needs a larger token budget
+for generation and repairs. Split them across providers when useful — a local
+VLM for the analysis, a fast small model for questions, and a stronger
+vision-capable model for the final prompt. The default question entry uses 1200
+output tokens, but this is not a hard cap: change that model entry's
+`maxTokens` value in Settings to use a different budget.
+
+Fresh generation, automatic repairs and user-requested revisions all receive
+the original `SKILL.md`, the complete required reference guides, the structured
+brief and every original reference image. A Ref2VA writer receives both
+`base-en.txt` (shared shot/camera/dialogue rules) and `ref-en.txt` instead of
+being handed only the latter.
 
 `reasoningEffort` is optional. An empty string leaves the provider default and
 does not send `reasoning_effort`; the settings page also offers `none`,

@@ -35,7 +35,7 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 		page   task.Page
 		reason string
 	)
-	client, cerr := s.writerClient()
+	client, cerr := s.questionClient()
 	if cerr != nil {
 		reason = cerr.Error()
 	} else {

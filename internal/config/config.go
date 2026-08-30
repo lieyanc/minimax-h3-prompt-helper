@@ -29,11 +29,12 @@ type Config struct {
 	// Providers are the endpoints an API key belongs to. Models point at one
 	// of them by ID.
 	Providers []Provider `json:"providers"`
-	// Models are the named entries the two roles below choose from.
+	// Models are the named entries the three model roles below choose from.
 	Models []Model `json:"models"`
 
-	Vision VisionConfig `json:"vision"`
-	Writer WriterConfig `json:"writer"`
+	Vision   VisionConfig   `json:"vision"`
+	Question QuestionConfig `json:"question"`
+	Writer   WriterConfig   `json:"writer"`
 
 	// StrictEnglish turns CJK leakage outside <d> and quoted screen text into a
 	// blocking error rather than a warning.
@@ -82,10 +83,19 @@ type VisionConfig struct {
 	ImageMaxEdge int `json:"imageMaxEdge"`
 }
 
-// WriterConfig picks the model that composes the final H3 prompt. It may be
-// the same entry as Vision.
-type WriterConfig struct {
+// QuestionConfig picks the fast model that asks the small number of details
+// the writer cannot safely infer. Its output budget comes from the selected
+// model entry's configurable MaxTokens value.
+type QuestionConfig struct {
 	ModelID string `json:"modelId"`
+}
+
+// WriterConfig picks the multimodal model that composes and revises the final
+// H3 prompt. The original reference images are sent to it at ImageMaxEdge in
+// addition to the fact sheets produced by Vision.
+type WriterConfig struct {
+	ModelID      string `json:"modelId"`
+	ImageMaxEdge int    `json:"imageMaxEdge"`
 }
 
 // Endpoint is a model joined to its provider: everything the llm client needs
@@ -118,14 +128,16 @@ func Default(home string) Config {
 		Providers: []Provider{
 			{ID: "openai", Name: "OpenAI", BaseURL: "https://api.openai.com/v1"},
 		},
-		// Two entries pointing at the same provider: the roles want different
-		// sampling even when they run on one model.
+		// Separate entries let the fast interviewer and the long-form multimodal
+		// writer use different models and sampling profiles.
 		Models: []Model{
 			{ID: "vision", ProviderID: "openai", Model: "gpt-4o", DisplayName: "看图的模型", MaxTokens: 4096, Temperature: 0.2},
+			{ID: "question", ProviderID: "openai", Model: "gpt-4o-mini", DisplayName: "快速提问模型", MaxTokens: 1200, Temperature: 0.2},
 			{ID: "writer", ProviderID: "openai", Model: "gpt-4o", DisplayName: "写提示词的模型", MaxTokens: 8192, Temperature: 0.7},
 		},
 		Vision:          VisionConfig{ModelID: "vision", ImageMaxEdge: 1280},
-		Writer:          WriterConfig{ModelID: "writer"},
+		Question:        QuestionConfig{ModelID: "question"},
+		Writer:          WriterConfig{ModelID: "writer", ImageMaxEdge: 1280},
 		StrictEnglish:   true,
 		MaxRepairRounds: 2,
 	}
@@ -288,6 +300,7 @@ func (c *Config) migrateLegacy(data []byte) {
 		},
 	}
 	c.Vision.ModelID = "vision"
+	c.Question.ModelID = "writer"
 	c.Writer.ModelID = "writer"
 }
 
@@ -363,7 +376,7 @@ func (m *Manager) Filled() []string { return append([]string(nil), m.filled...) 
 
 // repair replaces values that cannot work with the default, returning the
 // dotted names of everything it touched. Zero stays meaningful where it has a
-// meaning: maxRepairRounds 0 disables repairs, imageMaxEdge 0 sends the
+// meaning: maxRepairRounds 0 disables repairs, either imageMaxEdge 0 sends the
 // original image.
 func (c *Config) repair(def Config) []string {
 	var fixed []string
@@ -387,6 +400,10 @@ func (c *Config) repair(def Config) []string {
 	if c.Vision.ImageMaxEdge < 0 {
 		c.Vision.ImageMaxEdge = def.Vision.ImageMaxEdge
 		fixed = append(fixed, "vision.imageMaxEdge")
+	}
+	if c.Writer.ImageMaxEdge < 0 {
+		c.Writer.ImageMaxEdge = def.Writer.ImageMaxEdge
+		fixed = append(fixed, "writer.imageMaxEdge")
 	}
 
 	fixed = append(fixed, c.repairProviders(def)...)
@@ -516,8 +533,17 @@ func (c *Config) repairRoles() []string {
 		c.Vision.ModelID = first
 		fixed = append(fixed, "vision.modelId")
 	}
+	if id := strings.TrimSpace(c.Question.ModelID); !known[id] {
+		// Old configurations have no question role. Following the writer keeps
+		// them working until the user chooses a faster model in Settings.
+		c.Question.ModelID = c.Writer.ModelID
+		if !known[c.Question.ModelID] {
+			c.Question.ModelID = c.Vision.ModelID
+		}
+		fixed = append(fixed, "question.modelId")
+	}
 	if id := strings.TrimSpace(c.Writer.ModelID); !known[id] {
-		// One model for both roles is a valid setup, so the vision entry is a
+		// One model for all roles is a valid setup, so the vision entry is a
 		// better fallback than the first one in the list.
 		c.Writer.ModelID = c.Vision.ModelID
 		fixed = append(fixed, "writer.modelId")
@@ -627,6 +653,13 @@ func (m *Manager) VisionEndpoint() (Endpoint, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.cfg.resolve(m.cfg.Vision.ModelID)
+}
+
+// QuestionEndpoint is the fast model that plans the next critical question.
+func (m *Manager) QuestionEndpoint() (Endpoint, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.cfg.resolve(m.cfg.Question.ModelID)
 }
 
 // WriterEndpoint is the model that composes the prompt.

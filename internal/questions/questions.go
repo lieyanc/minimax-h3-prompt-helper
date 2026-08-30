@@ -23,11 +23,15 @@ import (
 	"h3helper/internal/task"
 )
 
-// MaxQuestions is the most questions one page may carry.
-const MaxQuestions = 3
+// MaxQuestions is the most questions one page may carry. Keeping this at two
+// makes the interviewer choose the highest-impact uncertainty instead of
+// turning the H3 guide into a long questionnaire.
+const MaxQuestions = 2
 
-// maxPages stops an interview that will not end on its own.
-const maxPages = 12
+// maxPages includes the opening intent page plus at most three adaptive
+// follow-up pages. The writer is expected to infer ordinary style, camera and
+// sound details from the brief and the reference images.
+const maxPages = 4
 
 // Next returns the next page of questions. The opening intent question is
 // deterministic — the agent has nothing to reason about before it — and every
@@ -85,6 +89,13 @@ func Next(ctx context.Context, client *llm.Client, t *task.Task) (task.Page, err
 // Fallback is the page the deterministic table would ask. It stands in when the
 // agent cannot be reached, so the interview never dead-ends on a network error.
 func Fallback(t *task.Task, reason string) task.Page {
+	if len(t.Rounds)+1 > maxPages {
+		return task.Page{
+			Index: len(t.Rounds) + 1, Done: true, Title: "关键信息已够",
+			Note:      fmt.Sprintf("追问已达到 %d 页上限，剩余细节由写作模型结合参考图补全。", maxPages),
+			Questions: []task.Question{}, Fallback: true,
+		}
+	}
 	qs := slots.Next(t, MaxQuestions)
 	page := task.Page{
 		Index:     len(t.Rounds) + 1,
@@ -116,19 +127,21 @@ A ComfyUI workflow has already fixed the input mode, the canvas, the duration an
 	b.WriteString("===== BEGIN SKILL =====\n")
 	b.WriteString(skill.SkillMD())
 	b.WriteString("\n===== END SKILL =====\n\n")
-	b.WriteString(fmt.Sprintf("===== BEGIN FORMAT GUIDE (%s) =====\n", t.Constraints.Mode))
-	b.WriteString(skill.GuideFor(t.Constraints.Mode))
-	b.WriteString("\n===== END FORMAT GUIDE =====\n\n")
+	b.WriteString(fmt.Sprintf("===== BEGIN REQUIRED REFERENCE GUIDES (%s) =====\n", t.Constraints.Mode))
+	b.WriteString(skill.FullGuideFor(t.Constraints.Mode))
+	b.WriteString("\n===== END REQUIRED REFERENCE GUIDES =====\n\n")
 
 	b.WriteString(`How to interview:
-- Ask only what the guide needs for this mode and this exact set of reference assets. Never ask for anything the workflow already fixes (mode, canvas, duration, frame count, which labels exist) or anything the vision facts already state.
+- Ask only about a CRITICAL uncertainty whose answer would materially change the video and which the writer cannot safely infer from the user's brief, the reference images, or ordinary defaults. Never turn every field in the guide into a question.
+- Prefer inference over questioning for visual style, shot count, camera movement, soundscape, music and ending. Ask about one of them only when two plausible choices would produce meaningfully different results. Dialogue/lyrics and exact on-screen text are critical only when the brief implies they exist but does not supply them.
+- Never ask for anything the workflow already fixes (mode, canvas, duration, frame count, which labels exist), anything the vision facts already state, or a confirmation of a sensible inference. Do not ask the user to restate the brief in more detail.
 - The reference images are not interchangeable and their meaning is not implied by their number. Read the facts first: a picture may be a character, a location, a costume, a prop, an interface, a storyboard or a style plate. Ask about what is actually in the image — never a generic "what is <Picture 1>". When several pictures are of the same kind, ask what distinguishes their roles (who is who, which one is the opening, what the second location is for).
-- One page covers one topic, carries at most 3 questions, and comes after the decisions it depends on. Ask the choice that constrains the rest first.
+- One page carries at most 2 short questions. Ask the single highest-impact question first; include a second only when it is tightly coupled to the first. There are at most 3 adaptive follow-up pages after the opening intent question, so finish early whenever possible.
 - Write every user-facing string (title, help, why, option labels, option descriptions, placeholder, intro) in Chinese. Keep option VALUES in the exact English the guide uses when they come from a controlled vocabulary, and keep verbatim material (dialogue, on-screen text) in whatever language the user will type.
 - Assume the user has no filmmaking knowledge. Ask concrete questions in everyday Chinese, explain what the result will look like, and never require the user to understand an English term or unexplained jargon. For visual style and camera movement, always ask a choice question with the corresponding controlled vocabulary instead of asking the user to invent a technical term.
 - Pre-fill "suggestion" from the vision facts or from the answers so far whenever you honestly can, so the common case is "confirm and continue". For a choice question the suggestion has to be one of the option values.
 - When a question is about something the user must supply verbatim (dialogue, lyrics, on-screen text), say so in "help": the validator diffs it word for word.
-- Set "done": true with an empty question list once everything below is settled. Do not pad the interview.
+- Set "done": true with an empty question list as soon as the writer has enough to make a strong result. Do not seek exhaustive coverage and do not pad the interview.
 
 Controlled vocabularies are not negotiable. When a question asks for one, set "vocab" and leave "options" empty — the server fills in the canonical list:
 - "camera": the camera motion types of the guide
@@ -148,7 +161,7 @@ Set "role" when the answer has a fixed downstream use, and leave it empty otherw
 - "image_role" what a reference asset is for, "image_retention" how much of it must survive — both take "label" as well
 `)
 
-	b.WriteString("\nCoverage — the guide needs all of these settled before a prompt can be written. Skip whatever this mode, this workflow or the vision facts already settle:\n")
+	b.WriteString("\nWriter concerns — use these only to spot a critical ambiguity, not as a checklist to ask through. The writer may infer everything non-critical:\n")
 	for i, item := range coverage(t) {
 		b.WriteString(fmt.Sprintf("%d. %s\n", i+1, item))
 	}
