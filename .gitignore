@@ -1,0 +1,16 @@
+# Go
+bin/
+*.test
+
+# Embedded frontend build output — regenerate with `make web`.
+webui/dist/*
+!webui/dist/.gitkeep
+
+# Frontend
+web/node_modules/
+web/dist/
+.DS_Store
+
+# Local runtime data
+data/
+*.log
