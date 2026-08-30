@@ -78,6 +78,32 @@ func TestParsePageReplacesOptionsWithTheControlledVocabulary(t *testing.T) {
 	if !q.AllowFree {
 		t.Error("camera motion should still accept a phrase outside the list")
 	}
+	if q.Title != "你希望镜头怎么拍？" || !strings.Contains(q.Help, "摄影机怎么移动") {
+		t.Errorf("camera question is not beginner-facing Chinese: %+v", q)
+	}
+	for _, option := range q.Options {
+		if option.Label == option.Value || option.Desc == "" {
+			t.Errorf("camera option is not localized for beginners: %+v", option)
+		}
+	}
+}
+
+func TestParsePageMakesStylePresetQuestionBeginnerFacing(t *testing.T) {
+	raw := `{"page":{"questions":[{"slot":"look","role":"style","title":"Visual style?","help":"Choose an aesthetic","kind":"choice","vocab":"style"}]}}`
+
+	page, err := parsePage(raw, refTask())
+	if err != nil {
+		t.Fatalf("parsePage: %v", err)
+	}
+	q := page.Questions[0]
+	if q.Title != "你希望画面看起来像哪一种？" || !strings.Contains(q.Help, "不需要懂专业术语") {
+		t.Errorf("style question is not beginner-facing Chinese: %+v", q)
+	}
+	for _, option := range q.Options {
+		if option.Label == option.Value || option.Desc == "" {
+			t.Errorf("style option is not localized for beginners: %+v", option)
+		}
+	}
 }
 
 func TestParsePageSkipsAnsweredAndCapsThePage(t *testing.T) {

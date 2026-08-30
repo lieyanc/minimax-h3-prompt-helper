@@ -214,10 +214,12 @@ guide.
 does not send `reasoning_effort`; the settings page also offers `none`,
 `minimal`, `low`, `medium`, `high`, and `xhigh`. When it is set, `temperature`
 is omitted and the token limit is sent as `max_completion_tokens`, as required
-by OpenAI reasoning models. During prompt generation the server forwards
-content chunks immediately, and recognises the common `reasoning_content`,
-`reasoning`, `thinking`, and `reasoning_details` stream fields for the separate
-live reasoning panel.
+by OpenAI reasoning models. Every LLM request enables upstream streaming by
+default, including connection tests, vision analysis, question planning, and
+prompt generation. During prompt generation the server also forwards content
+chunks immediately, and recognises the common `reasoning_content`, `reasoning`,
+`thinking`, and `reasoning_details` stream fields for the separate live
+reasoning panel.
 
 A file written before providers existed, where `vision` and `writer` each
 carried their own `baseURL`, `apiKey` and `model`, is migrated on the next

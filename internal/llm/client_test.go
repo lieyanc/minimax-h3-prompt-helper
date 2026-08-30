@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// captureServer records the last request body and replies with a canned answer.
+// captureServer records the last request body and streams a canned answer.
 func captureServer(t *testing.T, reply string) (*httptest.Server, *map[string]any) {
 	t.Helper()
 	captured := map[string]any{}
@@ -24,8 +24,9 @@ func captureServer(t *testing.T, reply string) (*httptest.Server, *map[string]an
 		if err := json.Unmarshal(body, &captured); err != nil {
 			t.Errorf("request body is not JSON: %v", err)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"choices":[{"message":{"content":%q}}]}`, reply)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", reply)
+		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
 	t.Cleanup(srv.Close)
 	return srv, &captured
@@ -41,6 +42,9 @@ func TestTextMessageSerialisesAsPlainString(t *testing.T) {
 	}
 	if got != "ok" {
 		t.Errorf("Complete = %q, want %q", got, "ok")
+	}
+	if stream, ok := (*captured)["stream"].(bool); !ok || !stream {
+		t.Errorf("Complete stream = %#v, want true by default", (*captured)["stream"])
 	}
 
 	msgs := (*captured)["messages"].([]any)

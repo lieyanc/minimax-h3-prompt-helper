@@ -629,6 +629,17 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 	}
 	defer sse.close()
 
+	// Model calls dominate the cost of this pass and each image is independent,
+	// so start every valid reference image at once. Results are buffered and
+	// consumed below by this request goroutine, keeping SSE writes and task-file
+	// updates serial even though the upstream vision requests run concurrently.
+	type analysisResult struct {
+		label string
+		facts task.Facts
+	}
+	results := make(chan analysisResult, len(t.Images))
+	pending := 0
+
 	for _, img := range t.Images {
 		path, err := s.imagePath(t, img)
 		if err != nil {
@@ -649,24 +660,29 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 		}
 
 		sse.send("progress", map[string]any{"label": img.Label, "state": "analyzing"})
-		facts, err := vision.Analyze(r.Context(), client, path, img.Label, maxEdge)
-		if err != nil {
-			facts.Error = err.Error()
-		}
+		pending++
+		go func(label, path string) {
+			facts, err := vision.Analyze(r.Context(), client, path, label, maxEdge)
+			if err != nil {
+				facts.Error = err.Error()
+			}
+			results <- analysisResult{label: label, facts: facts}
+		}(img.Label, path)
+	}
 
-		label := img.Label
-		captured := facts
+	for range pending {
+		result := <-results
 		if _, uerr := s.store.Update(id, func(t *task.Task) error {
 			if t.Facts == nil {
 				t.Facts = map[string]task.Facts{}
 			}
-			t.Facts[label] = captured
+			t.Facts[result.label] = result.facts
 			return nil
 		}); uerr != nil {
-			sse.send("image", map[string]any{"label": label, "error": uerr.Error()})
+			sse.send("image", map[string]any{"label": result.label, "error": uerr.Error()})
 			continue
 		}
-		sse.send("image", map[string]any{"label": label, "facts": captured})
+		sse.send("image", map[string]any{"label": result.label, "facts": result.facts})
 	}
 
 	final, err := s.store.Update(id, func(t *task.Task) error {

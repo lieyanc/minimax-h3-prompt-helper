@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"h3helper/internal/skill"
 	"h3helper/internal/task"
 )
 
@@ -185,5 +186,35 @@ func TestShotOptionsRespectTheWorkflowDuration(t *testing.T) {
 	}
 	if opts[0].Value != "1" {
 		t.Errorf("the first shot option should be a single shot, got %q", opts[0].Value)
+	}
+}
+
+func TestVisualPresetOptionsUseChineseBeginnerLabels(t *testing.T) {
+	tests := []struct {
+		name       string
+		options    []task.Option
+		wantValues []string
+	}{
+		{name: "style", options: StyleOptions(), wantValues: skill.Styles},
+		{name: "camera", options: CameraOptions(), wantValues: skill.CameraMotions},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if len(tt.options) != len(tt.wantValues) {
+				t.Fatalf("got %d options, want %d", len(tt.options), len(tt.wantValues))
+			}
+			for i, option := range tt.options {
+				if option.Value != tt.wantValues[i] {
+					t.Errorf("option %d value = %q, want canonical value %q", i, option.Value, tt.wantValues[i])
+				}
+				if option.Label == "" || option.Label == option.Value {
+					t.Errorf("option %q still exposes its English value as the label", option.Value)
+				}
+				if option.Desc == "" {
+					t.Errorf("option %q has no beginner-facing explanation", option.Value)
+				}
+			}
+		})
 	}
 }

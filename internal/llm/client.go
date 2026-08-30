@@ -109,38 +109,11 @@ type Options struct {
 	Temperature *float64
 }
 
-// Complete performs a non-streaming completion and returns the assistant text.
+// Complete performs a streaming completion and returns the assembled assistant
+// text. Callers that do not need live deltas can use this convenience method;
+// the upstream request still has streaming enabled.
 func (c *Client) Complete(ctx context.Context, msgs []Message, opts Options) (string, error) {
-	body, err := c.request(ctx, msgs, opts, false)
-	if err != nil {
-		return "", err
-	}
-	defer body.Close()
-
-	var resp struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-		Error *struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	data, err := io.ReadAll(body)
-	if err != nil {
-		return "", err
-	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return "", fmt.Errorf("decode response: %w (body: %s)", err, snippet(data))
-	}
-	if resp.Error != nil && resp.Error.Message != "" {
-		return "", fmt.Errorf("upstream error: %s", resp.Error.Message)
-	}
-	if len(resp.Choices) == 0 {
-		return "", fmt.Errorf("no choices in response: %s", snippet(data))
-	}
-	return resp.Choices[0].Message.Content, nil
+	return c.Stream(ctx, msgs, opts, nil)
 }
 
 // Delta is one incremental piece from a streaming completion. Providers use
@@ -153,7 +126,7 @@ type Delta struct {
 // Stream performs a streaming completion, invoking onDelta as soon as each
 // reasoning or content chunk arrives, and returns the complete assistant text.
 func (c *Client) Stream(ctx context.Context, msgs []Message, opts Options, onDelta func(Delta)) (string, error) {
-	body, err := c.request(ctx, msgs, opts, true)
+	body, err := c.request(ctx, msgs, opts)
 	if err != nil {
 		return "", err
 	}
@@ -220,7 +193,7 @@ func (c *Client) Stream(ctx context.Context, msgs []Message, opts Options, onDel
 	return full.String(), nil
 }
 
-func (c *Client) request(ctx context.Context, msgs []Message, opts Options, stream bool) (io.ReadCloser, error) {
+func (c *Client) request(ctx context.Context, msgs []Message, opts Options) (io.ReadCloser, error) {
 	if c.BaseURL == "" {
 		return nil, fmt.Errorf("接口地址未配置")
 	}
@@ -241,7 +214,7 @@ func (c *Client) request(ctx context.Context, msgs []Message, opts Options, stre
 		Model:           c.Model,
 		Messages:        msgs,
 		ReasoningEffort: c.ReasoningEffort,
-		Stream:          stream,
+		Stream:          true,
 	}
 	// OpenAI reasoning models use max_completion_tokens and reject temperature.
 	// Compatible non-reasoning endpoints keep receiving the older field names.
@@ -269,9 +242,7 @@ func (c *Client) request(ctx context.Context, msgs []Message, opts Options, stre
 	if c.APIKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
 	}
-	if stream {
-		httpReq.Header.Set("Accept", "text/event-stream")
-	}
+	httpReq.Header.Set("Accept", "text/event-stream")
 
 	resp, err := c.HTTP.Do(httpReq)
 	if err != nil {

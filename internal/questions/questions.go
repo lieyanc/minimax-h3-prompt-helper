@@ -125,6 +125,7 @@ A ComfyUI workflow has already fixed the input mode, the canvas, the duration an
 - The reference images are not interchangeable and their meaning is not implied by their number. Read the facts first: a picture may be a character, a location, a costume, a prop, an interface, a storyboard or a style plate. Ask about what is actually in the image — never a generic "what is <Picture 1>". When several pictures are of the same kind, ask what distinguishes their roles (who is who, which one is the opening, what the second location is for).
 - One page covers one topic, carries at most 3 questions, and comes after the decisions it depends on. Ask the choice that constrains the rest first.
 - Write every user-facing string (title, help, why, option labels, option descriptions, placeholder, intro) in Chinese. Keep option VALUES in the exact English the guide uses when they come from a controlled vocabulary, and keep verbatim material (dialogue, on-screen text) in whatever language the user will type.
+- Assume the user has no filmmaking knowledge. Ask concrete questions in everyday Chinese, explain what the result will look like, and never require the user to understand an English term or unexplained jargon. For visual style and camera movement, always ask a choice question with the corresponding controlled vocabulary instead of asking the user to invent a technical term.
 - Pre-fill "suggestion" from the vision facts or from the answers so far whenever you honestly can, so the common case is "confirm and continue". For a choice question the suggestion has to be one of the option values.
 - When a question is about something the user must supply verbatim (dialogue, lyrics, on-screen text), say so in "help": the validator diffs it word for word.
 - Set "done": true with an empty question list once everything below is settled. Do not pad the interview.
@@ -474,6 +475,7 @@ func sanitize(rq rawQuestion, t *task.Task, index int) (task.Question, bool) {
 		q.Options = opts
 		q.Kind = task.KindChoice
 		q.AllowFree = free
+		applyBeginnerPresetCopy(&q)
 	} else {
 		for _, o := range rq.Options {
 			label := strings.TrimSpace(o.Label)
@@ -510,6 +512,26 @@ func sanitize(rq rawQuestion, t *task.Task, index int) (task.Question, bool) {
 		}
 	}
 	return q, true
+}
+
+// applyBeginnerPresetCopy makes the controlled visual presets understandable
+// even when the question model returns a terse title or filmmaking jargon.
+// The option values remain the guide's exact English vocabulary.
+func applyBeginnerPresetCopy(q *task.Question) {
+	switch strings.TrimSpace(strings.ToLower(q.Vocab)) {
+	case "style", "styles":
+		q.Group = "画面风格"
+		q.Title = "你希望画面看起来像哪一种？"
+		q.Help = "按你想要的成片感觉选择即可，不需要懂专业术语；有参考图时，一般选最接近参考图的风格。"
+	case "camera", "camera_motion":
+		q.Group = "镜头"
+		q.Title = "你希望镜头怎么拍？"
+		q.Help = "这里问的是摄影机怎么移动，不是人物怎么动。拿不准时可选“镜头固定不动”。"
+	case "camera_dynamic", "amplitude", "speed":
+		q.Group = "镜头"
+		q.Title = "镜头移动得多快、多明显？"
+		q.Help = "拿不准就选“默认”，模型会使用自然的运动幅度和速度。"
+	}
 }
 
 // slotKey keeps generated keys stable and free of anything that would confuse

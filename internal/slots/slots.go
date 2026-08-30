@@ -134,8 +134,8 @@ func Definitions(t *task.Task) []Def {
 			Group:     "画面",
 			Role:      task.RoleStyle,
 			EnLabel:   "Visual style",
-			Title:     "整体视觉风格",
-			Help:      "写在 [Shot 1] 开头。有参考图时应当沿用图里的风格。",
+			Title:     "你希望画面看起来像哪一种？",
+			Help:      "按你想要的成片感觉选择即可，不需要懂专业术语；有参考图时，一般选最接近参考图的风格。",
 			Kind:      task.KindChoice,
 			Required:  true,
 			AllowFree: true,
@@ -159,8 +159,8 @@ func Definitions(t *task.Task) []Def {
 			Group:     "镜头",
 			Role:      task.RoleCamera,
 			EnLabel:   "Camera motion",
-			Title:     "主镜头运动",
-			Help:      "规范里的受控词表，写成句子而不是标签堆叠。",
+			Title:     "你希望镜头怎么拍？",
+			Help:      "这里问的是摄影机怎么移动，不是人物怎么动。拿不准时可选“镜头固定不动”。",
 			Kind:      task.KindChoice,
 			Required:  true,
 			AllowFree: true,
@@ -172,8 +172,8 @@ func Definitions(t *task.Task) []Def {
 			Group:    "镜头",
 			Role:     task.RoleCameraDynamic,
 			EnLabel:  "Camera amplitude and speed",
-			Title:    "运动幅度和速度",
-			Help:     "中等幅度、常速通常省略不写。",
+			Title:    "镜头移动得多快、多明显？",
+			Help:     "拿不准就选“默认”，模型会使用自然的运动幅度和速度。",
 			Kind:     task.KindChoice,
 			Required: false,
 			Options: []task.Option{
@@ -499,18 +499,53 @@ func toQuestion(d Def, t *task.Task) task.Question {
 
 // StyleOptions is the guide's visual style vocabulary.
 func StyleOptions() []task.Option {
+	labels := map[string]task.Option{
+		"Cinematic":    {Label: "电影质感", Desc: "像剧情电影，光影、构图和色彩更有电影感"},
+		"live-action":  {Label: "真人实拍", Desc: "像摄影机拍摄的真实人物和场景"},
+		"2D-animated":  {Label: "二维动画", Desc: "像手绘动画、平面插画或卡通片"},
+		"3D CG":        {Label: "三维动画", Desc: "像三维建模制作的动画电影或游戏过场"},
+		"claymation":   {Label: "黏土定格动画", Desc: "像用黏土模型逐帧拍摄，带手工质感"},
+		"watercolor":   {Label: "水彩画", Desc: "像水彩绘画，颜色有晕染和纸张质感"},
+		"vintage film": {Label: "复古胶片", Desc: "像老电影胶片，带颗粒、旧色调和年代感"},
+	}
 	var out []task.Option
 	for _, s := range skill.Styles {
-		out = append(out, task.Option{Value: s, Label: s})
+		localized := labels[s]
+		localized.Value = s
+		out = append(out, localized)
 	}
 	return out
 }
 
 // CameraOptions is the guide's camera-motion vocabulary.
 func CameraOptions() []task.Option {
+	labels := map[string]task.Option{
+		"Zoom In":               {Label: "放大画面（变焦拉近）", Desc: "摄影机位置不动，只把主体越放越大"},
+		"Zoom Out":              {Label: "缩小画面（变焦拉远）", Desc: "摄影机位置不动，让画面露出更多环境"},
+		"Push In":               {Label: "镜头向前靠近主体", Desc: "摄影机真的向前移动，逐渐贴近人物或物体"},
+		"Pull Out":              {Label: "镜头向后远离主体", Desc: "摄影机真的向后移动，逐渐展示周围环境"},
+		"Pan Left":              {Label: "原地向左转镜头", Desc: "摄影机位置不动，视线水平转向左边"},
+		"Pan Right":             {Label: "原地向右转镜头", Desc: "摄影机位置不动，视线水平转向右边"},
+		"Truck Left":            {Label: "镜头水平向左移动", Desc: "整台摄影机向左平移，方向像横着走"},
+		"Truck Right":           {Label: "镜头水平向右移动", Desc: "整台摄影机向右平移，方向像横着走"},
+		"Tilt Up":               {Label: "原地向上抬镜头", Desc: "摄影机位置不动，视线从下往上看"},
+		"Tilt Down":             {Label: "原地向下压镜头", Desc: "摄影机位置不动，视线从上往下看"},
+		"Pedestal Up":           {Label: "整台镜头向上升", Desc: "摄影机保持朝向，整体垂直升高"},
+		"Pedestal Down":         {Label: "整台镜头向下降", Desc: "摄影机保持朝向，整体垂直降低"},
+		"Arc Shot":              {Label: "绕着主体转一段弧线", Desc: "摄影机环绕人物或物体移动，看到不同侧面"},
+		"Tracking Shot":         {Label: "跟着主体一起移动", Desc: "主体边走或边跑，摄影机持续跟随"},
+		"Static Shot":           {Label: "镜头固定不动", Desc: "摄影机不移动，只让画面里的主体行动"},
+		"Shake Slightly":        {Label: "镜头轻微晃动", Desc: "带一点自然手持感，画面不会太颠"},
+		"Shake Strongly":        {Label: "镜头强烈晃动", Desc: "明显震动，适合冲击、爆炸或混乱场面"},
+		"POV":                   {Label: "第一人称视角", Desc: "像观众亲眼看到，摄影机代表角色的眼睛"},
+		"Roll Clockwise":        {Label: "画面顺时针旋转", Desc: "摄影机沿镜头方向转动，让地平线倾斜并旋转"},
+		"Roll Counterclockwise": {Label: "画面逆时针旋转", Desc: "摄影机沿镜头方向反向转动，让地平线倾斜并旋转"},
+	}
 	var out []task.Option
 	for _, m := range skill.CameraMotions {
-		out = append(out, task.Option{Value: m, Label: m})
+		localized := labels[m]
+		localized.Value = m
+		out = append(out, localized)
 	}
 	return out
 }
