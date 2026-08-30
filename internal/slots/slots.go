@@ -1,6 +1,7 @@
-// Package slots turns the H3 writing rules into a fixed list of things the
-// user has to decide, and asks only for the ones that are still missing. The
-// question set is deterministic — no model decides what to ask.
+// Package slots holds the deterministic question table. It is the fallback the
+// server falls back on when the question agent cannot be reached, and the
+// source of the opening intent question the agent needs before it can decide
+// anything. In the normal path the questions come from the agent instead.
 package slots
 
 import (
@@ -46,25 +47,42 @@ type Def struct {
 	AllowFree   bool
 	Placeholder string
 	Options     []task.Option
-	Suggest     func(t *task.Task) string
-	Applies     func(t *task.Task) bool
+	// Role is the machine-readable use of the answer, shared with the questions
+	// the agent writes.
+	Role string
+	// Label is the reference label the question is about, when it is about one.
+	Label string
+	// EnLabel is the English name the answer carries into the writing prompt.
+	EnLabel string
+	Suggest func(t *task.Task) string
+	Applies func(t *task.Task) bool
+}
+
+// BriefQuestion is the opening question. It is deterministic because the
+// question agent needs the user's intent before it can decide anything else.
+func BriefQuestion(t *task.Task) task.Question {
+	return toQuestion(briefDef(), t)
+}
+
+func briefDef() Def {
+	return Def{
+		Slot:        Brief,
+		Group:       "意图",
+		Role:        task.RoleBrief,
+		EnLabel:     "Intent",
+		Title:       "这条视频要发生什么？一句话说清楚",
+		Help:        "模型能看懂图，但猜不出你的意图。写清楚主体做了什么、结果是什么。",
+		Kind:        task.KindTextarea,
+		Required:    true,
+		Placeholder: "例：女人放下手里的信，抬头看向窗外驶过的城市灯光",
+		Suggest:     suggestBrief,
+	}
 }
 
 // Definitions expands the full slot list for a task, including the per-image
 // slots that only exist in full-reference mode.
 func Definitions(t *task.Task) []Def {
-	defs := []Def{
-		{
-			Slot:        Brief,
-			Group:       "意图",
-			Title:       "这条视频要发生什么？一句话说清楚",
-			Help:        "模型能看懂图，但猜不出你的意图。写清楚主体做了什么、结果是什么。",
-			Kind:        task.KindTextarea,
-			Required:    true,
-			Placeholder: "例：女人放下手里的信，抬头看向窗外驶过的城市灯光",
-			Suggest:     suggestBrief,
-		},
-	}
+	defs := []Def{briefDef()}
 
 	// Full-reference mode needs a role and a retention strength per image.
 	if skill.IsRefMode(t.Constraints.Mode) {
@@ -76,6 +94,9 @@ func Definitions(t *task.Task) []Def {
 			defs = append(defs, Def{
 				Slot:     ImageRolePrefix + label,
 				Group:    "参考图",
+				Role:     task.RoleImageRole,
+				Label:    label,
+				EnLabel:  "Role of " + label,
 				Title:    fmt.Sprintf("%s 在这条视频里承担什么角色？", label),
 				Help:     "决定它写进 subject_definitions 时的定义方式。",
 				Kind:     task.KindChoice,
@@ -94,17 +115,15 @@ func Definitions(t *task.Task) []Def {
 			defs = append(defs, Def{
 				Slot:     ImageRetentionPrefix + label,
 				Group:    "参考图",
+				Role:     task.RoleImageRetention,
+				Label:    label,
+				EnLabel:  "Retention marker for " + label,
 				Title:    fmt.Sprintf("%s 的内容要保留到什么程度？", label),
 				Help:     "写进 retention_analysis 的固定关系标记。",
 				Kind:     task.KindChoice,
 				Required: true,
-				Options: []task.Option{
-					{Value: "fully_preserved", Label: "fully_preserved", Desc: "定义的特征完整保留"},
-					{Value: "partially_preserved", Label: "partially_preserved", Desc: "仍在使用，但部分特征被改动"},
-					{Value: "attribute_transfer", Label: "attribute_transfer", Desc: "特征转移到另一个可识别的主体上"},
-					{Value: "weak_reference", Label: "weak_reference", Desc: "只保留风格、类别或氛围上的相似"},
-				},
-				Suggest: func(*task.Task) string { return "fully_preserved" },
+				Options:  RetentionOptions(),
+				Suggest:  func(*task.Task) string { return "fully_preserved" },
 			})
 		}
 	}
@@ -113,6 +132,8 @@ func Definitions(t *task.Task) []Def {
 		Def{
 			Slot:      Style,
 			Group:     "画面",
+			Role:      task.RoleStyle,
+			EnLabel:   "Visual style",
 			Title:     "整体视觉风格",
 			Help:      "写在 [Shot 1] 开头。有参考图时应当沿用图里的风格。",
 			Kind:      task.KindChoice,
@@ -124,6 +145,8 @@ func Definitions(t *task.Task) []Def {
 		Def{
 			Slot:        Action,
 			Group:       "画面",
+			Role:        task.RoleAction,
+			EnLabel:     "Action path (start → middle → end)",
 			Title:       "动作路径：起点 → 过程 → 落点",
 			Help:        keyframeHelp(t.Constraints.Mode),
 			Kind:        task.KindTextarea,
@@ -134,6 +157,8 @@ func Definitions(t *task.Task) []Def {
 		Def{
 			Slot:      CameraMotion,
 			Group:     "镜头",
+			Role:      task.RoleCamera,
+			EnLabel:   "Camera motion",
 			Title:     "主镜头运动",
 			Help:      "规范里的受控词表，写成句子而不是标签堆叠。",
 			Kind:      task.KindChoice,
@@ -145,6 +170,8 @@ func Definitions(t *task.Task) []Def {
 		Def{
 			Slot:     CameraDynamic,
 			Group:    "镜头",
+			Role:     task.RoleCameraDynamic,
+			EnLabel:  "Camera amplitude and speed",
 			Title:    "运动幅度和速度",
 			Help:     "中等幅度、常速通常省略不写。",
 			Kind:     task.KindChoice,
@@ -162,6 +189,8 @@ func Definitions(t *task.Task) []Def {
 		Def{
 			Slot:     Shots,
 			Group:    "镜头",
+			Role:     task.RoleShots,
+			EnLabel:  "Shot count",
 			Title:    "分几个镜头？",
 			Help:     shotsHelp(t.Constraints),
 			Kind:     task.KindChoice,
@@ -172,6 +201,8 @@ func Definitions(t *task.Task) []Def {
 		Def{
 			Slot:     HasDialogue,
 			Group:    "声音",
+			Role:     task.RoleFreeform,
+			EnLabel:  "Has dialogue",
 			Title:    "有没有人说话或唱歌？",
 			Help:     "H3 会生成原生音轨，台词必须逐字给出，模型不能自己编。",
 			Kind:     task.KindChoice,
@@ -185,6 +216,8 @@ func Definitions(t *task.Task) []Def {
 		Def{
 			Slot:        DialogueLines,
 			Group:       "声音",
+			Role:        task.RoleDialogue,
+			EnLabel:     "Dialogue, verbatim",
 			Title:       "逐字写出台词",
 			Help:        "一行一句，格式：说话人描述 | 语言 | 台词原文。台词会被逐字比对，模型改一个字都会被判错。",
 			Kind:        task.KindTextarea,
@@ -195,6 +228,8 @@ func Definitions(t *task.Task) []Def {
 		Def{
 			Slot:     DialogueMode,
 			Group:    "声音",
+			Role:     task.RoleDialogueMode,
+			EnLabel:  "Dialogue delivery",
 			Title:    "台词是画内说出来的还是画外音？",
 			Kind:     task.KindChoice,
 			Required: true,
@@ -209,6 +244,8 @@ func Definitions(t *task.Task) []Def {
 		Def{
 			Slot:        ScreenText,
 			Group:       "画面",
+			Role:        task.RoleScreenText,
+			EnLabel:     "On-screen text (keep verbatim in double quotes)",
 			Title:       "画面上要出现的文字（招牌、字幕、霓虹灯等）",
 			Help:        "会原样放进英文双引号，不翻译。没有就留空。",
 			Kind:        task.KindText,
@@ -219,6 +256,8 @@ func Definitions(t *task.Task) []Def {
 		Def{
 			Slot:        Soundscape,
 			Group:       "声音",
+			Role:        task.RoleSoundscape,
+			EnLabel:     "Ambient and physical sound",
 			Title:       "环境音和动作音",
 			Help:        "只写环境、物理动作和非语言人声，台词不重复写在这里。留空则按画面推断。",
 			Kind:        task.KindTextarea,
@@ -229,6 +268,8 @@ func Definitions(t *task.Task) []Def {
 		Def{
 			Slot:     Music,
 			Group:    "声音",
+			Role:     task.RoleMusic,
+			EnLabel:  "Non-diegetic music wanted",
 			Title:    "要不要观众才听得到的配乐？",
 			Help:     "角色能听到的音乐属于画内声音，不写在 non_diegetic_music 里。",
 			Kind:     task.KindChoice,
@@ -242,6 +283,8 @@ func Definitions(t *task.Task) []Def {
 		Def{
 			Slot:        MusicDesc,
 			Group:       "声音",
+			Role:        task.RoleMusicDesc,
+			EnLabel:     "Non-diegetic music description",
 			Title:       "配乐的器乐、速度和动态",
 			Help:        "只写乐器、速度、节奏和强弱变化，不写情绪词。",
 			Kind:        task.KindText,
@@ -252,6 +295,8 @@ func Definitions(t *task.Task) []Def {
 		Def{
 			Slot:        Ending,
 			Group:       "意图",
+			Role:        task.RoleEnding,
+			EnLabel:     "Ending state",
 			Title:       "结尾要停在什么状态？",
 			Help:        endingHelp(t.Constraints.Mode),
 			Kind:        task.KindText,
@@ -291,7 +336,9 @@ func Next(t *task.Task, limit int) []task.Question {
 	return out
 }
 
-// MissingRequired lists the required slots that are still empty.
+// MissingRequired lists the required slots of the deterministic table that are
+// still empty. It describes the fallback engine's own idea of completeness; the
+// agent path uses Unanswered instead.
 func MissingRequired(t *task.Task) []string {
 	var out []string
 	for _, d := range Definitions(t) {
@@ -308,19 +355,39 @@ func MissingRequired(t *task.Task) []string {
 	return out
 }
 
-// Progress reports how many applicable slots have been answered.
+// Unanswered lists the titles of the required questions that have actually been
+// put to the user and are still empty. A question the agent never asked cannot
+// block anything.
+func Unanswered(t *task.Task) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, q := range append(append([]task.Question{}, t.Asked...), t.Pending...) {
+		if !q.Required || seen[q.Slot] {
+			continue
+		}
+		seen[q.Slot] = true
+		if strings.TrimSpace(t.Answer(q.Slot)) == "" {
+			title := q.Title
+			if title == "" {
+				title = q.Slot
+			}
+			out = append(out, title)
+		}
+	}
+	return out
+}
+
+// Progress reports how many questions have been answered and how many the
+// agent still expects, so the wizard can show a bar that does not lie about a
+// total nobody knows yet.
 func Progress(t *task.Task) (answered, total int) {
-	for _, d := range Definitions(t) {
-		if d.Applies != nil && !d.Applies(t) {
-			continue
-		}
-		if !d.Required {
-			continue
-		}
-		total++
-		if strings.TrimSpace(t.Answer(d.Slot)) != "" {
-			answered++
-		}
+	answered = t.AnsweredCount()
+	total = answered + len(Unanswered(t))
+	if !t.Plan.Done && t.Plan.Remaining > 0 {
+		total += t.Plan.Remaining
+	}
+	if total < answered {
+		total = answered
 	}
 	return answered, total
 }
@@ -328,15 +395,37 @@ func Progress(t *task.Task) (answered, total int) {
 // Filled is one answered slot, carried into the writing prompt with the
 // question it answered.
 type Filled struct {
-	Slot  string
-	Title string
-	Value string
+	Slot    string
+	Title   string
+	Value   string
+	Role    string
+	Label   string
+	EnLabel string
 }
 
-// Collect gathers the answered slots in definition order.
+// Collect gathers the answered slots in the order they were asked, falling back
+// to the fixed table for tasks written before the agent existed.
 func Collect(t *task.Task) []Filled {
 	var out []Filled
+	seen := map[string]bool{}
+	for _, q := range t.Asked {
+		if seen[q.Slot] {
+			continue
+		}
+		v := strings.TrimSpace(t.Answer(q.Slot))
+		if v == "" {
+			continue
+		}
+		seen[q.Slot] = true
+		out = append(out, Filled{
+			Slot: q.Slot, Title: q.Title, Value: v,
+			Role: q.Role, Label: q.Label, EnLabel: q.EnLabel,
+		})
+	}
 	for _, d := range Definitions(t) {
+		if seen[d.Slot] {
+			continue
+		}
 		if d.Applies != nil && !d.Applies(t) {
 			continue
 		}
@@ -344,7 +433,18 @@ func Collect(t *task.Task) []Filled {
 		if v == "" {
 			continue
 		}
-		out = append(out, Filled{Slot: d.Slot, Title: d.Title, Value: v})
+		seen[d.Slot] = true
+		out = append(out, Filled{
+			Slot: d.Slot, Title: d.Title, Value: v,
+			Role: d.Role, Label: d.Label, EnLabel: d.EnLabel,
+		})
+	}
+	// Anything answered outside both tables still belongs in the brief.
+	for slot, v := range t.Answers {
+		if seen[slot] || strings.TrimSpace(v) == "" {
+			continue
+		}
+		out = append(out, Filled{Slot: slot, Title: slot, Value: strings.TrimSpace(v)})
 	}
 	return out
 }
@@ -352,7 +452,10 @@ func Collect(t *task.Task) []Filled {
 // DialogueTexts splits the dialogue answer into verbatim lines for the
 // validator to diff against.
 func DialogueTexts(t *task.Task) []string {
-	raw := strings.TrimSpace(t.Answer(DialogueLines))
+	raw := strings.TrimSpace(t.AnswerByRole(task.RoleDialogue))
+	if raw == "" {
+		raw = strings.TrimSpace(t.Answer(DialogueLines))
+	}
 	if raw == "" {
 		return nil
 	}
@@ -382,6 +485,9 @@ func toQuestion(d Def, t *task.Task) task.Question {
 		Required:    d.Required,
 		AllowFree:   d.AllowFree,
 		Placeholder: d.Placeholder,
+		Role:        d.Role,
+		Label:       d.Label,
+		EnLabel:     d.EnLabel,
 	}
 	if d.Suggest != nil {
 		q.Suggestion = d.Suggest(t)
@@ -391,7 +497,8 @@ func toQuestion(d Def, t *task.Task) task.Question {
 
 // ------------------------------------------------------------ suggestions --
 
-func styleOptions() []task.Option {
+// StyleOptions is the guide's visual style vocabulary.
+func StyleOptions() []task.Option {
 	var out []task.Option
 	for _, s := range skill.Styles {
 		out = append(out, task.Option{Value: s, Label: s})
@@ -399,13 +506,61 @@ func styleOptions() []task.Option {
 	return out
 }
 
-func cameraOptions() []task.Option {
+// CameraOptions is the guide's camera-motion vocabulary.
+func CameraOptions() []task.Option {
 	var out []task.Option
 	for _, m := range skill.CameraMotions {
 		out = append(out, task.Option{Value: m, Label: m})
 	}
 	return out
 }
+
+// RetentionOptions is the fixed retention-marker vocabulary of
+// retention_analysis.
+func RetentionOptions() []task.Option {
+	desc := map[string]string{
+		"fully_preserved":     "定义的特征完整保留",
+		"partially_preserved": "仍在使用，但部分特征被改动",
+		"attribute_transfer":  "特征转移到另一个可识别的主体上",
+		"weak_reference":      "只保留风格、类别或氛围上的相似",
+	}
+	var out []task.Option
+	for _, m := range skill.RetentionMarkers {
+		out = append(out, task.Option{Value: m, Label: m, Desc: desc[m]})
+	}
+	return out
+}
+
+// AudioRetentionOptions is the fixed relationship vocabulary for <Audio N>.
+func AudioRetentionOptions() []task.Option {
+	desc := map[string]string{
+		"fully_copy":     "整条源音频原样成为成片音轨",
+		"partially_copy": "只复制部分时间线或部分声音层",
+		"reference":      "不复制信号，只参考音色、节奏、风格或内容",
+		"weak_reference": "只保留类别或氛围上的相似",
+	}
+	var out []task.Option
+	for _, m := range skill.AudioMarkers {
+		out = append(out, task.Option{Value: m, Label: m, Desc: desc[m]})
+	}
+	return out
+}
+
+// TaskTypeOptions is the fixed summary task-type vocabulary of Ref2VA.
+func TaskTypeOptions() []task.Option {
+	var out []task.Option
+	for _, m := range skill.TaskTypes {
+		out = append(out, task.Option{Value: m, Label: m})
+	}
+	return out
+}
+
+// ShotOptions lists the shot counts the workflow duration can carry.
+func ShotOptions(c task.Constraints) []task.Option { return shotOptions(c) }
+
+func styleOptions() []task.Option { return StyleOptions() }
+
+func cameraOptions() []task.Option { return CameraOptions() }
 
 func shotOptions(c task.Constraints) []task.Option {
 	out := []task.Option{

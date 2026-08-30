@@ -13,4 +13,6 @@ web/dist/
 
 # Local runtime data
 data/
+config.json
+tasks/
 *.log

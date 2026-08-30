@@ -35,9 +35,8 @@ func main() {
 	if err != nil {
 		home = "."
 	}
-	defaultData := filepath.Join(home, ".local", "share", "h3-prompt-helper")
 
-	dataDir := flag.String("data", defaultData, "数据目录（配置和任务 JSON 都放这里）")
+	dataDir := flag.String("data", "data", "数据目录（默认是当前运行目录下的 data）")
 	listen := flag.String("listen", "", "监听地址，覆盖配置文件，例如 0.0.0.0:8199")
 	comfyRoot := flag.String("comfyui", "", "ComfyUI 根目录，覆盖配置文件")
 	showVersion := flag.Bool("version", false, "打印版本后退出")
@@ -58,7 +57,7 @@ func run(dataDir, listenOverride, comfyOverride, home string) error {
 		return fmt.Errorf("创建数据目录: %w", err)
 	}
 
-	cfg, err := config.Load(filepath.Join(dataDir, "config.json"), home)
+	cfg, err := config.Load("config.json", home)
 	if err != nil {
 		return fmt.Errorf("读取配置: %w", err)
 	}
@@ -80,8 +79,13 @@ func run(dataDir, listenOverride, comfyOverride, home string) error {
 		return fmt.Errorf("打开任务目录: %w", err)
 	}
 
+	uploadDir := filepath.Join(dataDir, "uploads")
+	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
+		return fmt.Errorf("创建上传目录: %w", err)
+	}
+
 	lib := comfy.NewLibrary(cfg.WorkflowSearchDirs(), cfg.InputDir())
-	srv := api.New(cfg, lib, st, webui.Handler(), version)
+	srv := api.New(cfg, lib, st, uploadDir, webui.Handler(), version)
 
 	current := cfg.Snapshot()
 	httpServer := &http.Server{
@@ -112,8 +116,8 @@ func run(dataDir, listenOverride, comfyOverride, home string) error {
 	for _, addr := range localURLs(current.Listen) {
 		log.Printf("访问地址   %s", addr)
 	}
-	if current.Vision.Model == "" {
-		log.Printf("提示：还没填视觉模型，分析参考图和生成提示词都会失败。在设置页填好接口地址和模型名，或直接改 %s。", cfg.Path())
+	if ep, err := cfg.VisionEndpoint(); err != nil || ep.Model == "" || ep.BaseURL == "" {
+		log.Printf("提示：视觉模型还没配好，分析参考图和生成提示词都会失败。在设置页添加供应商和模型，或直接改 %s。", cfg.Path())
 	}
 	if current.Token == "" {
 		log.Printf("提示：当前没有设置访问令牌，局域网内任何人都能打开。可在设置页里配置。")

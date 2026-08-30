@@ -72,7 +72,7 @@ func Analyze(ctx context.Context, client *llm.Client, imagePath, label string, m
 }
 
 func parseFacts(raw string, facts *task.Facts) error {
-	body := extractJSON(raw)
+	body := llm.ExtractJSON(raw)
 	if body == "" {
 		return fmt.Errorf("模型没有返回 JSON：%s", truncate(raw, 200))
 	}
@@ -102,52 +102,6 @@ func parseFacts(raw string, facts *task.Facts) error {
 	facts.ColorPalette = parsed.ColorPalette
 	facts.PossibleAction = parsed.PossibleAction
 	return nil
-}
-
-// extractJSON pulls the first balanced JSON object out of a reply, tolerating
-// markdown fences and leading prose.
-func extractJSON(s string) string {
-	s = strings.TrimSpace(s)
-	if i := strings.Index(s, "```"); i >= 0 {
-		rest := s[i+3:]
-		if j := strings.Index(rest, "\n"); j >= 0 {
-			rest = rest[j+1:]
-		}
-		if k := strings.Index(rest, "```"); k >= 0 {
-			s = strings.TrimSpace(rest[:k])
-		}
-	}
-	start := strings.Index(s, "{")
-	if start < 0 {
-		return ""
-	}
-	depth, inStr, escaped := 0, false, false
-	for i := start; i < len(s); i++ {
-		c := s[i]
-		if inStr {
-			switch {
-			case escaped:
-				escaped = false
-			case c == '\\':
-				escaped = true
-			case c == '"':
-				inStr = false
-			}
-			continue
-		}
-		switch c {
-		case '"':
-			inStr = true
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				return s[start : i+1]
-			}
-		}
-	}
-	return ""
 }
 
 func truncate(s string, n int) string {

@@ -85,7 +85,7 @@ func userPrompt(t *task.Task) string {
 		b.WriteString(fmt.Sprintf("- Canvas: %dx%d (%s). Compose for this frame shape.\n", c.Width, c.Height, c.AspectLabel))
 	}
 	b.WriteString(labelBlock(c))
-	if n := strings.TrimSpace(t.Answer(slots.Shots)); n != "" {
+	if n := shotCount(t); n != "" {
 		b.WriteString(fmt.Sprintf("- Shot count: %s. Do not add more shots than this.\n", n))
 	}
 	for _, note := range c.Notes {
@@ -108,10 +108,10 @@ func userPrompt(t *task.Task) string {
 
 	b.WriteString("\n# The user's brief\n")
 	for _, f := range slots.Collect(t) {
-		if f.Slot == slots.Shots {
+		if f.Role == task.RoleShots {
 			continue
 		}
-		b.WriteString(fmt.Sprintf("- %s: %s\n", slotLabel(f.Slot, f.Title), f.Value))
+		b.WriteString(fmt.Sprintf("- %s: %s\n", answerLabel(f), f.Value))
 	}
 
 	if lines := slots.DialogueTexts(t); len(lines) > 0 {
@@ -119,17 +119,39 @@ func userPrompt(t *task.Task) string {
 		for _, l := range lines {
 			b.WriteString("- " + l + "\n")
 		}
-		if t.Answer(slots.DialogueMode) == "voiceover" {
+		if dialogueMode(t) == "voiceover" {
 			b.WriteString("These lines are voice-over: use the exact phrase `says in an off-screen voiceover` and state right after each </d> that the character's lips remain completely closed.\n")
 		}
 	}
 
-	if t.Answer(slots.Music) == "none" {
+	if musicChoice(t) == "none" {
 		b.WriteString("\nSet non_diegetic_music to exactly: N/A\n")
 	}
 
 	b.WriteString("\nNow write the final prompt.")
 	return b.String()
+}
+
+// shotCount reads the shot count whatever slot key the question agent gave it.
+func shotCount(t *task.Task) string {
+	if v := strings.TrimSpace(t.AnswerByRole(task.RoleShots)); v != "" {
+		return v
+	}
+	return strings.TrimSpace(t.Answer(slots.Shots))
+}
+
+func dialogueMode(t *task.Task) string {
+	if v := strings.TrimSpace(t.AnswerByRole(task.RoleDialogueMode)); v != "" {
+		return v
+	}
+	return strings.TrimSpace(t.Answer(slots.DialogueMode))
+}
+
+func musicChoice(t *task.Task) string {
+	if v := strings.TrimSpace(t.AnswerByRole(task.RoleMusic)); v != "" {
+		return v
+	}
+	return strings.TrimSpace(t.Answer(slots.Music))
 }
 
 func labelBlock(c task.Constraints) string {
@@ -194,7 +216,46 @@ func roleWords(role string) string {
 	return "reference asset"
 }
 
-// slotLabel maps internal slot keys to the English labels used in the brief.
+// answerLabel names an answer in the brief. The question agent supplies an
+// English label with every question it writes; the fixed table and anything
+// older fall back to the role table below.
+func answerLabel(f slots.Filled) string {
+	if f.EnLabel != "" {
+		return f.EnLabel
+	}
+	switch f.Role {
+	case task.RoleBrief:
+		return "Intent"
+	case task.RoleStyle:
+		return "Visual style"
+	case task.RoleAction:
+		return "Action path (start → middle → end)"
+	case task.RoleCamera:
+		return "Camera motion"
+	case task.RoleCameraDynamic:
+		return "Camera amplitude and speed"
+	case task.RoleDialogueMode:
+		return "Dialogue delivery"
+	case task.RoleScreenText:
+		return "On-screen text (keep verbatim in double quotes)"
+	case task.RoleSoundscape:
+		return "Ambient and physical sound"
+	case task.RoleMusic:
+		return "Non-diegetic music wanted"
+	case task.RoleMusicDesc:
+		return "Non-diegetic music description"
+	case task.RoleEnding:
+		return "Ending state"
+	case task.RoleImageRole:
+		return "Role of " + f.Label
+	case task.RoleImageRetention:
+		return "Retention marker for " + f.Label
+	}
+	return slotLabel(f.Slot, f.Title)
+}
+
+// slotLabel maps the fixed table's slot keys to the English labels used in the
+// brief. Tasks written before the question agent existed still carry them.
 func slotLabel(slot, fallback string) string {
 	switch slot {
 	case slots.Brief:

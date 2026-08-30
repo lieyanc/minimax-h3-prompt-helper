@@ -4,6 +4,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,6 +26,12 @@ type Config struct {
 	// default location from ComfyUIRoot.
 	WorkflowDirs []string `json:"workflowDirs"`
 
+	// Providers are the endpoints an API key belongs to. Models point at one
+	// of them by ID.
+	Providers []Provider `json:"providers"`
+	// Models are the named entries the two roles below choose from.
+	Models []Model `json:"models"`
+
 	Vision VisionConfig `json:"vision"`
 	Writer WriterConfig `json:"writer"`
 
@@ -36,26 +43,66 @@ type Config struct {
 	MaxRepairRounds int `json:"maxRepairRounds"`
 }
 
-// VisionConfig points at an OpenAI-compatible endpoint used for image understanding.
+// Provider is one OpenAI-compatible endpoint together with its key. ID is what
+// models refer to; Name is what the settings page shows.
+type Provider struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	BaseURL string `json:"baseURL"`
+	APIKey  string `json:"apiKey"`
+}
+
+// Model is one model served by ProviderID. Model is the name sent to the API,
+// DisplayName the label shown in the pickers.
+type Model struct {
+	ID              string  `json:"id"`
+	ProviderID      string  `json:"providerId"`
+	Model           string  `json:"model"`
+	DisplayName     string  `json:"displayName"`
+	MaxTokens       int     `json:"maxTokens"`
+	Temperature     float64 `json:"temperature"`
+	ReasoningEffort string  `json:"reasoningEffort"`
+}
+
+// Label is the name to show for a model, falling back to the API name.
+func (m Model) Label() string {
+	if s := strings.TrimSpace(m.DisplayName); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(m.Model); s != "" {
+		return s
+	}
+	return m.ID
+}
+
+// VisionConfig picks the model that reads the reference images.
 type VisionConfig struct {
-	BaseURL     string  `json:"baseURL"`
-	APIKey      string  `json:"apiKey"`
-	Model       string  `json:"model"`
-	MaxTokens   int     `json:"maxTokens"`
-	Temperature float64 `json:"temperature"`
+	ModelID string `json:"modelId"`
 	// ImageMaxEdge downsizes images before base64 upload. 0 disables resizing.
 	ImageMaxEdge int `json:"imageMaxEdge"`
 }
 
-// WriterConfig points at the model that composes the final H3 prompt. It may be
-// the same endpoint as Vision; SameAsVision keeps the two in sync.
+// WriterConfig picks the model that composes the final H3 prompt. It may be
+// the same entry as Vision.
 type WriterConfig struct {
-	SameAsVision bool    `json:"sameAsVision"`
-	BaseURL      string  `json:"baseURL"`
-	APIKey       string  `json:"apiKey"`
-	Model        string  `json:"model"`
-	MaxTokens    int     `json:"maxTokens"`
-	Temperature  float64 `json:"temperature"`
+	ModelID string `json:"modelId"`
+}
+
+// Endpoint is a model joined to its provider: everything the llm client needs
+// for one call, plus the labels the UI reports back.
+type Endpoint struct {
+	ProviderID   string
+	ProviderName string
+	BaseURL      string
+	APIKey       string
+	ModelID      string
+	Model        string
+	DisplayName  string
+	MaxTokens    int
+	Temperature  float64
+	// ReasoningEffort is sent as reasoning_effort when non-empty. Keeping the
+	// empty value means older OpenAI-compatible endpoints receive no new field.
+	ReasoningEffort string
 }
 
 // Default returns the built-in configuration. It is the single source of
@@ -68,17 +115,17 @@ func Default(home string) Config {
 		// Empty rather than nil: the released file should show an editable
 		// list, not a null.
 		WorkflowDirs: []string{},
-		Vision: VisionConfig{
-			BaseURL:      "https://api.openai.com/v1",
-			MaxTokens:    4096,
-			Temperature:  0.2,
-			ImageMaxEdge: 1280,
+		Providers: []Provider{
+			{ID: "openai", Name: "OpenAI", BaseURL: "https://api.openai.com/v1"},
 		},
-		Writer: WriterConfig{
-			SameAsVision: true,
-			MaxTokens:    8192,
-			Temperature:  0.7,
+		// Two entries pointing at the same provider: the roles want different
+		// sampling even when they run on one model.
+		Models: []Model{
+			{ID: "vision", ProviderID: "openai", Model: "gpt-4o", DisplayName: "看图的模型", MaxTokens: 4096, Temperature: 0.2},
+			{ID: "writer", ProviderID: "openai", Model: "gpt-4o", DisplayName: "写提示词的模型", MaxTokens: 8192, Temperature: 0.7},
 		},
+		Vision:          VisionConfig{ModelID: "vision", ImageMaxEdge: 1280},
+		Writer:          WriterConfig{ModelID: "writer"},
 		StrictEnglish:   true,
 		MaxRepairRounds: 2,
 	}
@@ -137,12 +184,23 @@ func Load(path, home string) (*Manager, error) {
 
 	// Unmarshalling onto the defaults leaves absent keys at their default
 	// value; the raw map is what tells us which keys those were.
-	if err := json.Unmarshal(data, &m.cfg); err != nil {
-		return nil, fmt.Errorf("%s 不是合法 JSON: %w", path, err)
-	}
 	var onDisk map[string]any
 	if err := json.Unmarshal(data, &onDisk); err != nil {
 		return nil, fmt.Errorf("%s 不是合法 JSON: %w", path, err)
+	}
+	// Lists are replaced, not merged: decoding into the default slice would
+	// leave its entries' other fields showing through the file's.
+	if _, ok := onDisk["providers"]; ok {
+		m.cfg.Providers = nil
+	}
+	if _, ok := onDisk["models"]; ok {
+		m.cfg.Models = nil
+	}
+	if err := json.Unmarshal(data, &m.cfg); err != nil {
+		return nil, fmt.Errorf("%s 不是合法 JSON: %w", path, err)
+	}
+	if _, ok := onDisk["providers"]; !ok {
+		m.cfg.migrateLegacy(data)
 	}
 
 	m.filled = missingKeys(asMap(def), onDisk, "")
@@ -155,6 +213,145 @@ func Load(path, home string) (*Manager, error) {
 		}
 	}
 	return m, nil
+}
+
+// legacyConfig is the pre-provider file shape, where each role carried its own
+// endpoint, key and model.
+type legacyConfig struct {
+	Vision struct {
+		BaseURL     string  `json:"baseURL"`
+		APIKey      string  `json:"apiKey"`
+		Model       string  `json:"model"`
+		MaxTokens   int     `json:"maxTokens"`
+		Temperature float64 `json:"temperature"`
+	} `json:"vision"`
+	Writer struct {
+		SameAsVision bool    `json:"sameAsVision"`
+		BaseURL      string  `json:"baseURL"`
+		APIKey       string  `json:"apiKey"`
+		Model        string  `json:"model"`
+		MaxTokens    int     `json:"maxTokens"`
+		Temperature  float64 `json:"temperature"`
+	} `json:"writer"`
+}
+
+// migrateLegacy rewrites a pre-provider file into one provider (two, if the
+// writer pointed somewhere else) plus a model entry per role, so upgrading
+// keeps the endpoint, the key and both sampling profiles.
+func (c *Config) migrateLegacy(data []byte) {
+	var old legacyConfig
+	if err := json.Unmarshal(data, &old); err != nil {
+		return
+	}
+	if strings.TrimSpace(old.Vision.BaseURL) == "" && strings.TrimSpace(old.Vision.Model) == "" {
+		return
+	}
+
+	taken := map[string]bool{}
+	visionProvider := Provider{
+		ID:      uniqueID(providerID(old.Vision.BaseURL), taken),
+		Name:    providerName(old.Vision.BaseURL),
+		BaseURL: TrimBaseURL(old.Vision.BaseURL),
+		APIKey:  strings.TrimSpace(old.Vision.APIKey),
+	}
+	c.Providers = []Provider{visionProvider}
+
+	writerProviderID := visionProvider.ID
+	writerBase := TrimBaseURL(old.Writer.BaseURL)
+	if !old.Writer.SameAsVision && writerBase != "" && writerBase != visionProvider.BaseURL {
+		writerProvider := Provider{
+			ID:      uniqueID(providerID(writerBase), taken),
+			Name:    providerName(writerBase),
+			BaseURL: writerBase,
+			APIKey:  strings.TrimSpace(old.Writer.APIKey),
+		}
+		c.Providers = append(c.Providers, writerProvider)
+		writerProviderID = writerProvider.ID
+	}
+
+	writerModel := strings.TrimSpace(old.Writer.Model)
+	if writerModel == "" {
+		writerModel = strings.TrimSpace(old.Vision.Model)
+	}
+	c.Models = []Model{
+		{
+			ID: "vision", ProviderID: visionProvider.ID,
+			Model:       strings.TrimSpace(old.Vision.Model),
+			DisplayName: roleLabel(old.Vision.Model, "看图"),
+			MaxTokens:   old.Vision.MaxTokens, Temperature: old.Vision.Temperature,
+		},
+		{
+			ID: "writer", ProviderID: writerProviderID,
+			Model:       writerModel,
+			DisplayName: roleLabel(writerModel, "写作"),
+			MaxTokens:   old.Writer.MaxTokens, Temperature: old.Writer.Temperature,
+		},
+	}
+	c.Vision.ModelID = "vision"
+	c.Writer.ModelID = "writer"
+}
+
+// providerID derives a stable identifier from an endpoint's host.
+func providerID(baseURL string) string {
+	host := baseURL
+	if u, err := url.Parse(strings.TrimSpace(baseURL)); err == nil && u.Host != "" {
+		host = u.Host
+	}
+	return slug(host)
+}
+
+// providerName prefers the name of a known preset, so a migrated file reads
+// like something a human typed.
+func providerName(baseURL string) string {
+	trimmed := TrimBaseURL(baseURL)
+	for _, p := range Presets() {
+		if p.BaseURL == trimmed {
+			return p.Name
+		}
+	}
+	if u, err := url.Parse(trimmed); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return trimmed
+}
+
+// roleLabel names a migrated entry after the model and the job it did, so the
+// two are told apart in the pickers even when they run the same model.
+func roleLabel(model, role string) string {
+	if s := strings.TrimSpace(model); s != "" {
+		return fmt.Sprintf("%s（%s）", s, role)
+	}
+	return role + "的模型"
+}
+
+// slug reduces a string to an identifier made of letters, digits and dashes.
+// It returns "" for input with nothing usable, such as a purely CJK name.
+func slug(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(s)) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_':
+			b.WriteRune(r)
+		default:
+			if b.Len() > 0 && !strings.HasSuffix(b.String(), "-") {
+				b.WriteRune('-')
+			}
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+// uniqueID marks base as taken, appending -2, -3 … until it is free.
+func uniqueID(base string, taken map[string]bool) string {
+	if base == "" {
+		base = "item"
+	}
+	id := base
+	for n := 2; taken[id]; n++ {
+		id = fmt.Sprintf("%s-%d", base, n)
+	}
+	taken[id] = true
+	return id
 }
 
 // Created reports whether the config file was written from scratch this run.
@@ -178,7 +375,6 @@ func (c *Config) repair(def Config) []string {
 	}
 	str("listen", &c.Listen, def.Listen)
 	str("comfyuiRoot", &c.ComfyUIRoot, def.ComfyUIRoot)
-	str("vision.baseURL", &c.Vision.BaseURL, def.Vision.BaseURL)
 
 	if c.WorkflowDirs == nil {
 		c.WorkflowDirs = []string{}
@@ -188,37 +384,143 @@ func (c *Config) repair(def Config) []string {
 		c.MaxRepairRounds = def.MaxRepairRounds
 		fixed = append(fixed, "maxRepairRounds")
 	}
-	if c.Vision.MaxTokens <= 0 {
-		c.Vision.MaxTokens = def.Vision.MaxTokens
-		fixed = append(fixed, "vision.maxTokens")
-	}
-	if c.Vision.Temperature < 0 {
-		c.Vision.Temperature = def.Vision.Temperature
-		fixed = append(fixed, "vision.temperature")
-	}
 	if c.Vision.ImageMaxEdge < 0 {
 		c.Vision.ImageMaxEdge = def.Vision.ImageMaxEdge
 		fixed = append(fixed, "vision.imageMaxEdge")
 	}
-	if c.Writer.MaxTokens <= 0 {
-		c.Writer.MaxTokens = def.Writer.MaxTokens
-		fixed = append(fixed, "writer.maxTokens")
-	}
-	if c.Writer.Temperature < 0 {
-		c.Writer.Temperature = def.Writer.Temperature
-		fixed = append(fixed, "writer.temperature")
+
+	fixed = append(fixed, c.repairProviders(def)...)
+	fixed = append(fixed, c.repairModels(def)...)
+	fixed = append(fixed, c.repairRoles()...)
+	return fixed
+}
+
+// repairProviders gives every endpoint a unique id and a name, and normalises
+// the address. Ids the user chose are kept as typed.
+func (c *Config) repairProviders(def Config) []string {
+	var fixed []string
+	if len(c.Providers) == 0 {
+		c.Providers = append([]Provider{}, def.Providers...)
+		fixed = append(fixed, "providers")
 	}
 
-	// The settings page says not to include the method path, but pasting a
-	// full endpoint is the obvious mistake to make.
-	for name, p := range map[string]*string{
-		"vision.baseURL": &c.Vision.BaseURL,
-		"writer.baseURL": &c.Writer.BaseURL,
-	} {
-		if trimmed := TrimBaseURL(*p); trimmed != *p {
-			*p = trimmed
-			fixed = append(fixed, name)
+	taken := map[string]bool{}
+	for i := range c.Providers {
+		p := &c.Providers[i]
+		name := func(key string) string { return fmt.Sprintf("providers[%d].%s", i, key) }
+
+		// The settings page says not to include the method path, but pasting a
+		// full endpoint is the obvious mistake to make.
+		if trimmed := TrimBaseURL(p.BaseURL); trimmed != p.BaseURL {
+			p.BaseURL = trimmed
+			fixed = append(fixed, name("baseURL"))
 		}
+		p.Name = strings.TrimSpace(p.Name)
+		p.APIKey = strings.TrimSpace(p.APIKey)
+
+		id := strings.TrimSpace(p.ID)
+		if id == "" {
+			id = providerID(p.BaseURL)
+		}
+		if id == "" {
+			id = slug(p.Name)
+		}
+		if id == "" {
+			id = fmt.Sprintf("provider-%d", i+1)
+		}
+		if unique := uniqueID(id, taken); unique != p.ID {
+			p.ID = unique
+			fixed = append(fixed, name("id"))
+		}
+		if p.Name == "" {
+			p.Name = p.ID
+			fixed = append(fixed, name("name"))
+		}
+	}
+	return fixed
+}
+
+// defaultMaxTokens is what a model entry falls back to; the roles set their
+// own in Default.
+const defaultMaxTokens = 4096
+
+// repairModels gives every model a unique id and a live provider. A model
+// pointing at a deleted provider falls back to the first one rather than
+// failing at request time.
+func (c *Config) repairModels(def Config) []string {
+	var fixed []string
+	if len(c.Models) == 0 {
+		c.Models = append([]Model{}, def.Models...)
+		fixed = append(fixed, "models")
+	}
+
+	known := map[string]bool{}
+	for _, p := range c.Providers {
+		known[p.ID] = true
+	}
+	first := ""
+	if len(c.Providers) > 0 {
+		first = c.Providers[0].ID
+	}
+
+	taken := map[string]bool{}
+	for i := range c.Models {
+		mo := &c.Models[i]
+		name := func(key string) string { return fmt.Sprintf("models[%d].%s", i, key) }
+
+		mo.Model = strings.TrimSpace(mo.Model)
+		mo.DisplayName = strings.TrimSpace(mo.DisplayName)
+		mo.ReasoningEffort = strings.ToLower(strings.TrimSpace(mo.ReasoningEffort))
+
+		id := strings.TrimSpace(mo.ID)
+		if id == "" {
+			id = slug(mo.Model)
+		}
+		if id == "" {
+			id = fmt.Sprintf("model-%d", i+1)
+		}
+		if unique := uniqueID(id, taken); unique != mo.ID {
+			// Roles referring to the old id are re-pointed by repairRoles.
+			mo.ID = unique
+			fixed = append(fixed, name("id"))
+		}
+		if pid := strings.TrimSpace(mo.ProviderID); !known[pid] {
+			mo.ProviderID = first
+			fixed = append(fixed, name("providerId"))
+		}
+		if mo.MaxTokens <= 0 {
+			mo.MaxTokens = defaultMaxTokens
+			fixed = append(fixed, name("maxTokens"))
+		}
+		if mo.Temperature < 0 {
+			mo.Temperature = 0
+			fixed = append(fixed, name("temperature"))
+		}
+	}
+	return fixed
+}
+
+// repairRoles points each role at a model that exists.
+func (c *Config) repairRoles() []string {
+	var fixed []string
+	known := map[string]bool{}
+	for _, mo := range c.Models {
+		known[mo.ID] = true
+	}
+	first := ""
+	if len(c.Models) > 0 {
+		first = c.Models[0].ID
+	}
+
+	if id := strings.TrimSpace(c.Vision.ModelID); !known[id] {
+		c.Vision.ModelID = first
+		fixed = append(fixed, "vision.modelId")
+	}
+	if id := strings.TrimSpace(c.Writer.ModelID); !known[id] {
+		// One model for both roles is a valid setup, so the vision entry is a
+		// better fallback than the first one in the list.
+		c.Writer.ModelID = c.Vision.ModelID
+		fixed = append(fixed, "writer.modelId")
 	}
 	return fixed
 }
@@ -281,6 +583,8 @@ func (m *Manager) Snapshot() Config {
 	defer m.mu.RUnlock()
 	out := m.cfg
 	out.WorkflowDirs = append([]string{}, m.cfg.WorkflowDirs...)
+	out.Providers = append([]Provider{}, m.cfg.Providers...)
+	out.Models = append([]Model{}, m.cfg.Models...)
 	return out
 }
 
@@ -311,22 +615,55 @@ func (m *Manager) save() error {
 	return os.Rename(tmp, m.path)
 }
 
-// ResolvedWriter returns the writer endpoint, falling back to the vision one.
-func (m *Manager) ResolvedWriter() WriterConfig {
+// Resolve joins a model entry to its provider.
+func (m *Manager) Resolve(modelID string) (Endpoint, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	w := m.cfg.Writer
-	if w.SameAsVision {
-		w.BaseURL = m.cfg.Vision.BaseURL
-		w.APIKey = m.cfg.Vision.APIKey
-		if w.Model == "" {
-			w.Model = m.cfg.Vision.Model
+	return m.cfg.resolve(modelID)
+}
+
+// VisionEndpoint is the model that reads the reference images.
+func (m *Manager) VisionEndpoint() (Endpoint, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.cfg.resolve(m.cfg.Vision.ModelID)
+}
+
+// WriterEndpoint is the model that composes the prompt.
+func (m *Manager) WriterEndpoint() (Endpoint, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.cfg.resolve(m.cfg.Writer.ModelID)
+}
+
+func (c *Config) resolve(modelID string) (Endpoint, error) {
+	if len(c.Models) == 0 {
+		return Endpoint{}, fmt.Errorf("还没有配置任何模型，先在设置页添加一个")
+	}
+	modelID = strings.TrimSpace(modelID)
+	idx := -1
+	for i, mo := range c.Models {
+		if mo.ID == modelID {
+			idx = i
+			break
 		}
 	}
-	if w.MaxTokens <= 0 {
-		w.MaxTokens = 8192
+	if idx < 0 {
+		return Endpoint{}, fmt.Errorf("找不到模型 %q，请在设置页重新选择", modelID)
 	}
-	return w
+	mo := c.Models[idx]
+
+	for _, p := range c.Providers {
+		if p.ID != mo.ProviderID {
+			continue
+		}
+		return Endpoint{
+			ProviderID: p.ID, ProviderName: p.Name, BaseURL: p.BaseURL, APIKey: p.APIKey,
+			ModelID: mo.ID, Model: mo.Model, DisplayName: mo.Label(),
+			MaxTokens: mo.MaxTokens, Temperature: mo.Temperature, ReasoningEffort: mo.ReasoningEffort,
+		}, nil
+	}
+	return Endpoint{}, fmt.Errorf("模型 %q 指向的供应商 %q 不存在", mo.Label(), mo.ProviderID)
 }
 
 // WorkflowSearchDirs lists every directory scanned for workflow files.

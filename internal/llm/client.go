@@ -16,23 +16,25 @@ import (
 
 // Client talks to one OpenAI-compatible endpoint.
 type Client struct {
-	BaseURL     string
-	APIKey      string
-	Model       string
-	MaxTokens   int
-	Temperature float64
-	HTTP        *http.Client
+	BaseURL         string
+	APIKey          string
+	Model           string
+	MaxTokens       int
+	Temperature     float64
+	ReasoningEffort string
+	HTTP            *http.Client
 }
 
 // New builds a client with a long timeout suited to streaming generations.
-func New(baseURL, apiKey, model string, maxTokens int, temperature float64) *Client {
+func New(baseURL, apiKey, model string, maxTokens int, temperature float64, reasoningEffort string) *Client {
 	return &Client{
-		BaseURL:     strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		APIKey:      strings.TrimSpace(apiKey),
-		Model:       strings.TrimSpace(model),
-		MaxTokens:   maxTokens,
-		Temperature: temperature,
-		HTTP:        &http.Client{Timeout: 15 * time.Minute},
+		BaseURL:         strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		APIKey:          strings.TrimSpace(apiKey),
+		Model:           strings.TrimSpace(model),
+		MaxTokens:       maxTokens,
+		Temperature:     temperature,
+		ReasoningEffort: strings.ToLower(strings.TrimSpace(reasoningEffort)),
+		HTTP:            &http.Client{Timeout: 15 * time.Minute},
 	}
 }
 
@@ -86,12 +88,14 @@ func (m Message) MarshalJSON() ([]byte, error) {
 }
 
 type chatRequest struct {
-	Model          string          `json:"model"`
-	Messages       []Message       `json:"messages"`
-	MaxTokens      int             `json:"max_tokens,omitempty"`
-	Temperature    *float64        `json:"temperature,omitempty"`
-	Stream         bool            `json:"stream,omitempty"`
-	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+	Model               string          `json:"model"`
+	Messages            []Message       `json:"messages"`
+	MaxTokens           int             `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int             `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64        `json:"temperature,omitempty"`
+	ReasoningEffort     string          `json:"reasoning_effort,omitempty"`
+	Stream              bool            `json:"stream,omitempty"`
+	ResponseFormat      *responseFormat `json:"response_format,omitempty"`
 }
 
 type responseFormat struct {
@@ -139,9 +143,16 @@ func (c *Client) Complete(ctx context.Context, msgs []Message, opts Options) (st
 	return resp.Choices[0].Message.Content, nil
 }
 
-// Stream performs a streaming completion, invoking onDelta for each chunk, and
-// returns the full text.
-func (c *Client) Stream(ctx context.Context, msgs []Message, opts Options, onDelta func(string)) (string, error) {
+// Delta is one incremental piece from a streaming completion. Providers use
+// several names for visible reasoning; Stream normalises the common variants.
+type Delta struct {
+	Content   string
+	Reasoning string
+}
+
+// Stream performs a streaming completion, invoking onDelta as soon as each
+// reasoning or content chunk arrives, and returns the complete assistant text.
+func (c *Client) Stream(ctx context.Context, msgs []Message, opts Options, onDelta func(Delta)) (string, error) {
 	body, err := c.request(ctx, msgs, opts, true)
 	if err != nil {
 		return "", err
@@ -163,7 +174,11 @@ func (c *Client) Stream(ctx context.Context, msgs []Message, opts Options, onDel
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Content string `json:"content"`
+					Content          string          `json:"content"`
+					ReasoningContent string          `json:"reasoning_content"`
+					Reasoning        json.RawMessage `json:"reasoning"`
+					Thinking         json.RawMessage `json:"thinking"`
+					ReasoningDetails json.RawMessage `json:"reasoning_details"`
 				} `json:"delta"`
 			} `json:"choices"`
 			Error *struct {
@@ -177,12 +192,25 @@ func (c *Client) Stream(ctx context.Context, msgs []Message, opts Options, onDel
 			return full.String(), fmt.Errorf("upstream error: %s", chunk.Error.Message)
 		}
 		for _, ch := range chunk.Choices {
-			if ch.Delta.Content == "" {
-				continue
+			reasoning := ch.Delta.ReasoningContent
+			if reasoning == "" {
+				reasoning = rawText(ch.Delta.Reasoning)
 			}
-			full.WriteString(ch.Delta.Content)
-			if onDelta != nil {
-				onDelta(ch.Delta.Content)
+			if reasoning == "" {
+				reasoning = rawText(ch.Delta.Thinking)
+			}
+			if reasoning == "" {
+				reasoning = rawText(ch.Delta.ReasoningDetails)
+			}
+			if onDelta != nil && reasoning != "" {
+				onDelta(Delta{Reasoning: reasoning})
+			}
+
+			if ch.Delta.Content != "" {
+				full.WriteString(ch.Delta.Content)
+				if onDelta != nil {
+					onDelta(Delta{Content: ch.Delta.Content})
+				}
 			}
 		}
 	}
@@ -210,11 +238,18 @@ func (c *Client) request(ctx context.Context, msgs []Message, opts Options, stre
 	}
 
 	req := chatRequest{
-		Model:       c.Model,
-		Messages:    msgs,
-		MaxTokens:   maxTokens,
-		Temperature: &temp,
-		Stream:      stream,
+		Model:           c.Model,
+		Messages:        msgs,
+		ReasoningEffort: c.ReasoningEffort,
+		Stream:          stream,
+	}
+	// OpenAI reasoning models use max_completion_tokens and reject temperature.
+	// Compatible non-reasoning endpoints keep receiving the older field names.
+	if c.ReasoningEffort == "" {
+		req.MaxTokens = maxTokens
+		req.Temperature = &temp
+	} else {
+		req.MaxCompletionTokens = maxTokens
 	}
 	if opts.JSONObject {
 		req.ResponseFormat = &responseFormat{Type: "json_object"}
@@ -256,4 +291,43 @@ func snippet(data []byte) string {
 		return s[:500] + "…"
 	}
 	return s
+}
+
+// rawText extracts text from string-valued reasoning fields and from the
+// small object/array shapes used by OpenRouter and a few local servers.
+func rawText(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return ""
+	}
+	return nestedText(value)
+}
+
+func nestedText(value any) string {
+	switch v := value.(type) {
+	case []any:
+		var out strings.Builder
+		for _, item := range v {
+			out.WriteString(nestedText(item))
+		}
+		return out.String()
+	case map[string]any:
+		for _, key := range []string{"text", "content", "reasoning", "thinking"} {
+			if child, ok := v[key]; ok {
+				if text := nestedText(child); text != "" {
+					return text
+				}
+			}
+		}
+	case string:
+		return v
+	}
+	return ""
 }
